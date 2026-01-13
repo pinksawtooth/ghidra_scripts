@@ -22,6 +22,10 @@ from ghidra.program.model.data import (
 )
 from ghidra.program.model.lang import OperandType
 from ghidra.program.flatapi import FlatProgramAPI
+try:
+    from ghidra.features.base.values import GhidraValuesMap
+except Exception:
+    GhidraValuesMap = None
 
 flatapi = FlatProgramAPI(currentProgram)
 
@@ -251,6 +255,37 @@ def parse_script_args(params):
     return True
 
 
+def prompt_for_params(params):
+    if GhidraValuesMap is None:
+        raise RuntimeError("GhidraValuesMap is unavailable in this Ghidra environment.")
+
+    values = GhidraValuesMap()
+    key_push = "Search immediate hash operands"
+    key_dword = "Search dword arrays of hashes"
+    key_struct = "Create struct for consecutive hash hits"
+    key_xor_use = "XOR seed hash values before lookup"
+    key_xor_seed = "XOR seed (e.g. 0x1234)"
+    values.defineBoolean(key_push, True)
+    values.defineBoolean(key_dword, True)
+    values.defineBoolean(key_struct, False)
+    values.defineBoolean(key_xor_use, False)
+    values.defineString(key_xor_seed, "0x0")
+    result = askValues("Shellcode Hash Search", "Search options", values)
+    if result is None:
+        return False
+
+    params.search_push_args = result.getBoolean(key_push)
+    params.search_dword_array = result.getBoolean(key_dword)
+    params.create_struct = result.getBoolean(key_struct)
+    params.use_xor_seed = result.getBoolean(key_xor_use)
+    if not params.search_push_args and not params.search_dword_array:
+        raise RuntimeError("No search types selected.")
+    if params.use_xor_seed:
+        seed_text = result.getString(key_xor_seed) or "0x0"
+        params.xor_seed = int(seed_text.strip(), 0)
+    return True
+
+
 class ShellcodeHashSearcher(object):
     def __init__(self, dbstore, params):
         self.dbstore = dbstore
@@ -447,32 +482,8 @@ def main():
     params = SearchParams()
     parsed = parse_script_args(params)
     if not parsed:
-        params.search_push_args = askYesNo(
-            "Shellcode Hash Search",
-            "Search for immediate hash operands?"
-        )
-        params.search_dword_array = askYesNo(
-            "Shellcode Hash Search",
-            "Search for dword arrays of hashes?"
-        )
-        params.create_struct = askYesNo(
-            "Shellcode Hash Search",
-            "Create struct for consecutive hash hits?"
-        )
-        if not params.search_push_args and not params.search_dword_array:
-            raise RuntimeError("No search types selected.")
-        use_xor = askYesNo(
-            "Shellcode Hash Search",
-            "XOR seed hash values before lookup?"
-        )
-        if use_xor:
-            params.use_xor_seed = True
-            seed_text = askString(
-                "Shellcode Hash Search",
-                "XOR seed (e.g. 0x1234)",
-                "0x0",
-            )
-            params.xor_seed = int(seed_text, 0)
+        if not prompt_for_params(params):
+            return
 
     params.address_set = get_address_set()
     db_path = get_default_db_path()
