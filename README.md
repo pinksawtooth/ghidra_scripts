@@ -10,7 +10,18 @@ Loads an IDA FLIRT `.sig` file, matches its signatures against functions in the 
 
 ## ApplyFlirtSignatures.java
 
-A native Java extension of `ApplySig.py` for stricter and more comprehensive FLIRT analysis. It reads binary IDASGN versions 5 through 10 directly without Rizin or sidecar files, validates patterns, CRCs, and tail bytes before modifying the program, and can discover and create previously undefined functions. Ambiguous matches are annotated instead of being guessed. Dry-run mode and JSON reports are also supported. Run it from **Tools > FLIRT > Apply FLIRT Signatures**.
+A native Java extension of `ApplySig.py` for stricter and more comprehensive FLIRT analysis. Run it from Ghidra's Script Manager.
+
+Additional features include:
+
+- Runs entirely inside Ghidra without launching Rizin or reading `validation.json` or other sidecar files.
+- Parses binary IDASGN versions 5 through 10, including compressed signatures for versions 6 through 10.
+- Validates exact patterns, CRCs, and tail bytes before modifying the program.
+- Discovers candidates beyond existing functions by using entry points, calls, references, relocations, typed pointers, pointer tables, code boundaries, and rare signature anchors.
+- Creates functions at verified undefined locations and safely splits contained function candidates only when structural evidence is sufficient.
+- Resolves candidates with FLIRT reference-graph and structural evidence; unresolved ambiguity fails closed and is recorded with a bookmark and repeatable comment.
+- Preserves user-defined function names, groups applied symbols under the signature library namespace, and normalizes or demangles supported Rust symbols.
+- Supports `--dry-run` analysis and optional JSON reports through `--report-json`.
 
 ## findcrypt.py
 
