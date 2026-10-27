@@ -13,6 +13,7 @@ import java.security.MessageDigest;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
@@ -41,22 +42,22 @@ import ghidra.app.util.PseudoDisassembler;
 import ghidra.app.util.PseudoInstruction;
 import ghidra.app.util.demangler.DemangledObject;
 import ghidra.app.util.demangler.MangledContext;
+import ghidra.app.util.demangler.microsoft.MicrosoftDemangler;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressRangeIterator;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
+import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.listing.BookmarkManager;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.Data;
-import ghidra.program.model.listing.DataIterator;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
-import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
@@ -70,6 +71,9 @@ import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.program.model.symbol.SymbolTable;
+import ghidra.program.model.symbol.SymbolType;
+import ghidra.program.model.util.StringPropertyMap;
+import ghidra.util.exception.DuplicateNameException;
 
 /**
  * Native Java implementation of strict SIG-only FLIRT signature application.
@@ -79,10 +83,14 @@ import ghidra.program.model.symbol.SymbolTable;
  * 5..10, including the compressed Rizin 0.9.1 v10 files used by this project.
  * Exact pattern, CRC and tail checks are performed before any Program DB
  * mutation.  Ambiguous identities fail closed and receive an Analysis /
- * FLIRT/Ambiguous bookmark plus a repeatable comment.</p>
+ * FLIRT/Ambiguous bookmark plus a repeatable comment.  Legacy Rust candidates
+ * that differ only by their hash or .llvm suffix demangle to one name and are
+ * applied under that name.  A public symbol at a non-zero module offset
+ * becomes a function only when independent entry evidence exists; otherwise
+ * it is a label.</p>
  */
 public class ApplyFlirtSignatures extends GhidraScript {
-    private static final String TOOL_VERSION = "1.0";
+    private static final String TOOL_VERSION = "1.1";
     private static final int FEATURE_COMPRESSED = 0x10;
     private static final int MORE_PUBLICS = 0x01;
     private static final int READ_TAILS = 0x02;
@@ -92,7 +100,10 @@ public class ApplyFlirtSignatures extends GhidraScript {
     private static final int FUNCTION_LOCAL = 0x02;
     private static final int FUNCTION_COLLISION = 0x08;
 
-    private static final int MATCH_WINDOW = 512;
+    /** Lower bound of the match window; the actual window covers every CRC and tail check. */
+    private static final int MIN_MATCH_WINDOW = 512;
+    private static final int MAX_MATCH_WINDOW = 64 * 1024;
+    private static final int ANCHOR_FILTER_BITS = 22;
     private static final int SIG_ANCHOR_BYTES = 8;
     private static final int SIG_ANCHOR_MAX_TREE_FANOUT = 64;
     private static final int SIG_ANCHOR_MIN_SEPARATION = SIG_ANCHOR_BYTES;
@@ -129,15 +140,34 @@ public class ApplyFlirtSignatures extends GhidraScript {
     /** Exact pointer-sized relocation stored in initialized non-executable data. */
     private static final int SOURCE_DATA_RELOCATION_POINTER = 2048;
 
+    /** The legacy Rust mangler writes $u..$ escapes with lower-case hex digits. */
     private static final Pattern RUST_UNICODE =
-        Pattern.compile("_u([0-9A-Fa-f]{2,6})_");
+        Pattern.compile("_u([0-9a-f]{2,6})_");
     private static final Pattern RUST_CANONICAL_UNICODE =
         Pattern.compile("\\$u([0-9A-Fa-f]{2,6})\\$");
-    private static final Pattern RUST_STRUCTURAL_SANITIZED =
-        Pattern.compile("_(?:LT|GT|SP|BP|RF|LP|RP)_|_u[0-9A-Fa-f]{2,6}_");
+    private static final Pattern RUST_STRUCTURAL_MARKER =
+        Pattern.compile("_(?:LT|GT|SP|BP|RF|LP|RP)_");
+    private static final Pattern RUST_LEGACY_HASH_SUFFIX =
+        Pattern.compile("17h[0-9a-f]{16}E(?:\\.llvm\\.[0-9]+)?(?:@[0-9]+)?$");
+    /** i686 stdcall decoration (extern "system") after a legacy name, as Rizin writes it. */
+    private static final Pattern RUST_SANITIZED_STDCALL = Pattern.compile("(_{1,2}ZN.*E)_([0-9]+)");
+    private static final Pattern STDCALL_SUFFIX = Pattern.compile("@[0-9]+$");
+    private static final Pattern RUST_V0_PREFIX = Pattern.compile("^_{1,2}R[0-9]*[CMXYNIB]");
+    /** Names Rizin invents for analysis-only blocks, such as case.0x1cbd9.19. */
+    private static final Pattern RIZIN_AUTO_NAME =
+        Pattern.compile("(?:case|fcn|sub|loc|switch)\\.(?:0x)?[0-9A-Fa-f]+(?:\\.[0-9]+)?");
+    /** Program property holding "library<TAB>identity" at every function this script named. */
+    private static final String IDENTITY_PROPERTY = "ApplyFlirtSignatures.Identity";
+    /** Identity record of an approximate ambig_ alias: the shared demangled meaning. */
+    private static final String AMBIGUOUS_RECORD = "ambiguous:";
+    private static final Pattern LOADER_PLACEHOLDER = Pattern.compile("entry|tls_callback_[0-9]+");
+    private static final Set<String> TRAP_MNEMONICS =
+        Set.of("UD0", "UD1", "UD2", "UDF", "BRK");
     private static final Map<String, String> RUST_RESTORE_CACHE = new HashMap<>();
     private static final Map<String, String> RUST_DEMANGLE_CACHE = new HashMap<>();
     private static final Map<String, String> RUST_SEMANTIC_CACHE = new HashMap<>();
+    private static final Map<String, String[]> MSVC_SEMANTIC_CACHE = new HashMap<>();
+    private static final MicrosoftDemangler MSVC_DEMANGLER = new MicrosoftDemangler();
 
     private Memory memory;
     private Listing listing;
@@ -149,6 +179,9 @@ public class ApplyFlirtSignatures extends GhidraScript {
     private Path signaturePath;
     private boolean dryRun;
     private Path reportPath;
+    /** Library namespace name; identifies this signature in identity records. */
+    private String libraryKey;
+    private StringPropertyMap identityRecords;
 
     private final Map<Long, Site> sites = new TreeMap<>();
     private final Map<Long, Integer> discoveredSources = new HashMap<>();
@@ -167,6 +200,13 @@ public class ApplyFlirtSignatures extends GhidraScript {
     private final List<Long> dataRelocationIdentityResolvedSites = new ArrayList<>();
     private final Map<String, Long> functionOnlyFailureReasons = new TreeMap<>();
     private final NavigableSet<Long> protectedFunctionEntries = new TreeSet<>();
+    private final List<Long> hashVariantResolvedSites = new ArrayList<>();
+    private final List<String[]> signatureConflictSites = new ArrayList<>();
+    private final List<String[]> importedNameSites = new ArrayList<>();
+    /** Sites a --dry-run counts as created, so later steps treat them as functions. */
+    private final Set<Long> dryRunFunctionSites = new HashSet<>();
+    private long[] anchorFilter = new long[0];
+    private PseudoDisassembler boundaryPseudo;
 
     private long functionsMatched;
     private long functionsCreated;
@@ -262,6 +302,23 @@ public class ApplyFlirtSignatures extends GhidraScript {
     private long rustNamesDemangled;
     private long rustDemangleFailed;
     private long rawNamesPreserved;
+    private long hashVariantResolved;
+    private long sweepRanges;
+    private long sweepBytes;
+    private long sigAnchorWeakLeavesSkipped;
+    private long sigAnchorWeakRejected;
+    private long secondaryPublicFunctions;
+    private long secondaryPublicLabels;
+    private long secondaryPublicLabelsExisting;
+    private long secondaryPublicLabelErrors;
+    private long signatureConflicts;
+    private long typeConsensusSites;
+    private long typeLabels;
+    private long typeLabelsExisting;
+    private long typeLabelSkips;
+    private long typeLabelErrors;
+    private long placeholderNamesReplaced;
+    private long importedNamesKept;
     private long startedNanos;
     private long parseNanos;
     private long initialMatchNanos;
@@ -271,6 +328,11 @@ public class ApplyFlirtSignatures extends GhidraScript {
     private long snapshotNanos;
     private long anchorIndexNanos;
     private long anchorScanNanos;
+    private long sweepNanos;
+    private long referenceNanos;
+    private long relocationNanos;
+    private long pointerTableNanos;
+    private long boundaryNanos;
     private int changeLogCount;
     private boolean changeLogSuppressed;
 
@@ -354,10 +416,14 @@ public class ApplyFlirtSignatures extends GhidraScript {
         final List<PublicSymbol> publics;
         final List<TailByte> tails;
         final List<PublicSymbol> refs;
+        // Path statistics are fixed by the module's leaf and set once by SigFile.
         int fixedBytes;
         int wildcardBytes;
         int patternBytes;
         int leafCandidates;
+        private boolean primaryResolved;
+        private String primary;
+        private Map<Long, Set<String>> expectedRefs;
         Module(int crcLength, int crc16, long length,
                List<PublicSymbol> publics, List<TailByte> tails,
                List<PublicSymbol> refs) {
@@ -369,16 +435,41 @@ public class ApplyFlirtSignatures extends GhidraScript {
             this.refs = refs;
         }
         String primaryName() {
+            if (primaryResolved) return primary;
             PublicSymbol best = null;
             for (PublicSymbol item : publics) {
                 if (item.local || item.name.isEmpty() || item.name.equals("?")) continue;
                 if (best == null || item.offset < best.offset) best = item;
             }
-            if (best != null) return best.name;
-            for (PublicSymbol item : publics) {
-                if (!item.name.isEmpty() && !item.name.equals("?")) return item.name;
+            if (best != null) primary = best.name;
+            else {
+                for (PublicSymbol item : publics) {
+                    if (!item.name.isEmpty() && !item.name.equals("?")) {
+                        primary = item.name;
+                        break;
+                    }
+                }
             }
-            return null;
+            primaryResolved = true;
+            return primary;
+        }
+        /** Named reference records by signed module offset. */
+        Map<Long, Set<String>> expectedRefs() {
+            if (expectedRefs != null) return expectedRefs;
+            Map<Long, Set<String>> result = new HashMap<>();
+            for (PublicSymbol reference : refs) {
+                String expected = canonicalIdentity(reference.name);
+                if (expected == null || expected.equals("?")) continue;
+                long signed = reference.negative ? -reference.offset : reference.offset;
+                result.computeIfAbsent(signed, ignored -> new HashSet<>()).add(expected);
+            }
+            expectedRefs = result;
+            return result;
+        }
+        long requiredWindow() {
+            long tail = -1;
+            for (TailByte item : tails) tail = Math.max(tail, item.offset);
+            return (long)patternBytes + crcLength + tail + 1;
         }
     }
 
@@ -396,12 +487,29 @@ public class ApplyFlirtSignatures extends GhidraScript {
         boolean leaf() { return children.isEmpty(); }
     }
 
+    private static final class PathFrame {
+        final Node node;
+        final int fixed;
+        final int wildcards;
+        final int length;
+        PathFrame(Node node, int fixed, int wildcards, int length) {
+            this.node = node;
+            this.fixed = fixed;
+            this.wildcards = wildcards;
+            this.length = length;
+        }
+    }
+
     private static final class SigFile {
         final Header header;
         final Node root;
         final Map<Integer, List<Node>> firstByte = new HashMap<>();
         final List<Node> firstFallback = new ArrayList<>();
         long modules;
+        long autoNamedPublicsDropped;
+        long autoNamedModulesDropped;
+        long modulesBeyondWindow;
+        int matchWindow = MIN_MATCH_WINDOW;
         SigFile(Header header, Node root) {
             this.header = header;
             this.root = root;
@@ -412,13 +520,41 @@ public class ApplyFlirtSignatures extends GhidraScript {
                 }
                 else firstFallback.add(child);
             }
-            Deque<Node> work = new ArrayDeque<>();
-            work.push(root);
+            // One walk fixes every module's path statistics, drops Rizin's
+            // invented names and sizes the match window for CRC and tail checks.
+            long window = MIN_MATCH_WINDOW;
+            Deque<PathFrame> work = new ArrayDeque<>();
+            work.push(new PathFrame(root, 0, 0, 0));
             while (!work.isEmpty()) {
-                Node node = work.pop();
+                PathFrame frame = work.pop();
+                Node node = frame.node;
+                int wildcards = 0;
+                for (boolean wildcard : node.wildcard) if (wildcard) wildcards++;
+                int fixed = frame.fixed + node.length - wildcards;
+                int totalWildcards = frame.wildcards + wildcards;
+                int length = frame.length + node.length;
+                node.modules.removeIf(module -> {
+                    int before = module.publics.size();
+                    module.publics.removeIf(item -> RIZIN_AUTO_NAME.matcher(item.name).matches());
+                    autoNamedPublicsDropped += before - module.publics.size();
+                    boolean drop = before != 0 && module.publics.isEmpty();
+                    if (drop) autoNamedModulesDropped++;
+                    return drop;
+                });
+                for (Module module : node.modules) {
+                    module.fixedBytes = fixed;
+                    module.wildcardBytes = totalWildcards;
+                    module.patternBytes = length;
+                    module.leafCandidates = node.modules.size();
+                    long required = module.requiredWindow();
+                    if (required > MAX_MATCH_WINDOW) modulesBeyondWindow++;
+                    else window = Math.max(window, required);
+                }
                 modules += node.modules.size();
-                work.addAll(node.children);
+                for (Node child : node.children)
+                    work.push(new PathFrame(child, fixed, totalWildcards, length));
             }
+            matchWindow = (int)window;
         }
     }
 
@@ -449,9 +585,52 @@ public class ApplyFlirtSignatures extends GhidraScript {
     private static final class LeafPattern {
         final byte[] pattern;
         final boolean[] wildcard;
-        LeafPattern(byte[] pattern, boolean[] wildcard) {
+        /** At least one module could pass the function-creation threshold. */
+        final boolean creatable;
+        LeafPattern(byte[] pattern, boolean[] wildcard, boolean creatable) {
             this.pattern = pattern;
             this.wildcard = wildcard;
+            this.creatable = creatable;
+        }
+    }
+
+    private static final class EvidenceKey {
+        final long offset;
+        final long length;
+        final int sources;
+        EvidenceKey(long offset, long length, int sources) {
+            this.offset = offset;
+            this.length = length;
+            this.sources = sources;
+        }
+        @Override
+        public boolean equals(Object value) {
+            if (!(value instanceof EvidenceKey)) return false;
+            EvidenceKey other = (EvidenceKey)value;
+            return offset == other.offset && length == other.length && sources == other.sources;
+        }
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(offset, length, sources);
+        }
+    }
+
+    private static final class ReferenceKey {
+        final long source;
+        final long signedOffset;
+        ReferenceKey(long source, long signedOffset) {
+            this.source = source;
+            this.signedOffset = signedOffset;
+        }
+        @Override
+        public boolean equals(Object value) {
+            if (!(value instanceof ReferenceKey)) return false;
+            ReferenceKey other = (ReferenceKey)value;
+            return source == other.source && signedOffset == other.signedOffset;
+        }
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(source, signedOffset);
         }
     }
 
@@ -593,15 +772,17 @@ public class ApplyFlirtSignatures extends GhidraScript {
 
     @Override
     protected void run() throws Exception {
-        startedNanos = System.nanoTime();
         resetNameCaches();
         parseArguments();
+        // Start timing after the signature file dialog.
+        startedNanos = System.nanoTime();
         initializeProgramHandles();
 
         long phase = System.nanoTime();
         signature = parseSignature(signaturePath);
         parseNanos = System.nanoTime() - phase;
         validateTarget();
+        libraryKey = sanitize(libraryName());
         libraryNamespace = dryRun ? null : makeNamespace(libraryName());
 
         phase = System.nanoTime();
@@ -631,6 +812,7 @@ public class ApplyFlirtSignatures extends GhidraScript {
         phase = System.nanoTime();
         decideAndApply();
         resolveBySigReferenceGraph();
+        resolveByHashVariants();
         processAmbiguousSites();
         applyNanos = System.nanoTime() - phase;
 
@@ -871,13 +1053,18 @@ public class ApplyFlirtSignatures extends GhidraScript {
             throw new IllegalArgumentException(
                 "x86 FLIRT signature cannot be applied to processor " + processor);
         }
+        // IDASGN application types: 0x0080 16-bit, 0x0100 32-bit, 0x0200 64-bit.
         int pointerSize = currentProgram.getDefaultPointerSize();
-        boolean admits32 = (signature.header.appTypes & 0x0001) != 0;
-        boolean admits64 = (signature.header.appTypes & 0x0100) != 0;
-        if (admits64 && !admits32 && pointerSize != 8)
-            throw new IllegalArgumentException("64-bit signature/program mismatch");
-        if (admits32 && !admits64 && pointerSize != 4 && pointerSize != 2)
-            throw new IllegalArgumentException("32-bit signature/program mismatch");
+        boolean admits16 = (signature.header.appTypes & 0x0080) != 0;
+        boolean admits32 = (signature.header.appTypes & 0x0100) != 0;
+        boolean admits64 = (signature.header.appTypes & 0x0200) != 0;
+        if (!(admits16 || admits32 || admits64)) return;
+        boolean compatible = pointerSize == 8 ? admits64 :
+            pointerSize == 4 ? admits32 || admits16 : admits16 || admits32;
+        if (!compatible)
+            throw new IllegalArgumentException(String.format(
+                "signature application types 0x%04X do not admit %d-byte pointers",
+                signature.header.appTypes, pointerSize));
     }
 
     /**
@@ -952,6 +1139,12 @@ public class ApplyFlirtSignatures extends GhidraScript {
         for (LeafPattern leaf : leaves) {
             List<Integer> windows = fixedAnchorOffsets(leaf);
             if (windows.isEmpty()) continue;
+            // Rarity counts every leaf, but a leaf that can never create a
+            // function would only yield candidates rejected as weak.
+            if (!leaf.creatable) {
+                sigAnchorWeakLeavesSkipped++;
+                continue;
+            }
             int primary = rarestAnchorOffset(leaf, windows, uses, -1);
             long primaryKey = anchorKey(leaf.pattern, primary);
             if (uses.getOrDefault(primaryKey, 0) > SIG_ANCHOR_MAX_TREE_FANOUT) {
@@ -971,6 +1164,22 @@ public class ApplyFlirtSignatures extends GhidraScript {
             probes.sort(Comparator.comparingInt((AnchorProbe value) -> value.primaryOffset)
                 .thenComparingInt(value -> value.secondaryOffset)
                 .thenComparingLong(value -> value.secondaryKey));
+        anchorFilter = new long[1 << (ANCHOR_FILTER_BITS - 6)];
+        for (long key : rareAnchorIndex.keySet()) {
+            int bit = anchorFilterBit(key);
+            anchorFilter[bit >>> 6] |= 1L << bit;
+        }
+    }
+
+    /** Bit index in the primitive pre-filter that guards the boxed anchor map. */
+    private static int anchorFilterBit(long key) {
+        return (int)((key * 0x9E3779B97F4A7C15L) >>> (64 - ANCHOR_FILTER_BITS));
+    }
+
+    private static boolean creatableModule(Module module) {
+        return module.fixedBytes >= MIN_CREATE_FIXED ||
+            (module.fixedBytes >= MIN_CREATE_CORROBORATED &&
+             (module.crcLength >= MIN_CRC || !module.tails.isEmpty()));
     }
 
     private void collectLeafPatterns(Node node, byte[] prefix, boolean[] prefixMask,
@@ -985,7 +1194,9 @@ public class ApplyFlirtSignatures extends GhidraScript {
         }
         if (node.leaf()) {
             sigAnchorLeafPaths++;
-            leaves.add(new LeafPattern(pattern, mask));
+            boolean creatable = false;
+            for (Module module : node.modules) creatable |= creatableModule(module);
+            leaves.add(new LeafPattern(pattern, mask, creatable));
             return;
         }
         for (Node child : node.children)
@@ -1029,14 +1240,15 @@ public class ApplyFlirtSignatures extends GhidraScript {
     }
 
     private byte[] readWindow(Address address) {
+        int window = signature.matchWindow;
         ExecutableSnapshot snapshot = executableSnapshot(address);
         if (snapshot != null) {
             try {
                 int offset = Math.toIntExact(address.subtract(snapshot.start));
-                int wanted = Math.min(MATCH_WINDOW, snapshot.bytes.length - offset);
+                int wanted = Math.min(window, snapshot.bytes.length - offset);
                 MemoryBlock block = memory.getBlock(address);
                 boolean artificialEnd = block != null &&
-                    snapshot.end.compareTo(block.getEnd()) < 0 && wanted < MATCH_WINDOW;
+                    snapshot.end.compareTo(block.getEnd()) < 0 && wanted < window;
                 if (!artificialEnd && wanted > 0) {
                     executableSnapshotReads++;
                     return Arrays.copyOfRange(snapshot.bytes, offset, offset + wanted);
@@ -1049,7 +1261,7 @@ public class ApplyFlirtSignatures extends GhidraScript {
             MemoryBlock block = memory.getBlock(address);
             if (block == null || !block.isInitialized()) return null;
             long available = block.getEnd().subtract(address) + 1;
-            int wanted = (int)Math.min(MATCH_WINDOW, Math.max(0, available));
+            int wanted = (int)Math.min(window, Math.max(0, available));
             if (wanted <= 0) return null;
             byte[] result = new byte[wanted];
             int read = memory.getBytes(address, result);
@@ -1070,37 +1282,27 @@ public class ApplyFlirtSignatures extends GhidraScript {
         roots.addAll(signature.firstFallback);
         List<MatchResult> out = new ArrayList<>();
         Map<Long, Integer> crcCache = new HashMap<>();
-        for (Node node : roots) collectMatches(node, bytes, 0, 0, 0, out, crcCache);
+        for (Node node : roots) collectMatches(node, bytes, 0, out, crcCache);
         return out;
     }
 
     private static void collectMatches(Node node, byte[] bytes, int offset,
-                                       int fixed, int wildcards,
                                        List<MatchResult> out,
                                        Map<Long, Integer> crcCache) {
         if (offset < 0 || offset + node.length > bytes.length) return;
-        int localWildcards = 0;
         for (int i = 0; i < node.length; i++) {
-            if (node.wildcard[i]) localWildcards++;
-            else if (bytes[offset + i] != node.pattern[i]) return;
+            if (!node.wildcard[i] && bytes[offset + i] != node.pattern[i]) return;
         }
-        fixed += node.length - localWildcards;
-        wildcards += localWildcards;
         int patternEnd = offset + node.length;
         if (node.leaf()) {
-            int leafCount = node.modules.size();
             for (Module module : node.modules) {
-                if (!modulePasses(module, bytes, patternEnd, crcCache)) continue;
-                module.fixedBytes = fixed;
-                module.wildcardBytes = wildcards;
-                module.patternBytes = patternEnd;
-                module.leafCandidates = leafCount;
-                out.add(new MatchResult(module, patternEnd));
+                if (modulePasses(module, bytes, patternEnd, crcCache))
+                    out.add(new MatchResult(module, patternEnd));
             }
         }
         else {
             for (Node child : node.children) {
-                collectMatches(child, bytes, patternEnd, fixed, wildcards, out, crcCache);
+                collectMatches(child, bytes, patternEnd, out, crcCache);
             }
         }
     }
@@ -1208,10 +1410,16 @@ public class ApplyFlirtSignatures extends GhidraScript {
             if (block.isInitialized() && block.isExecute()) executableBlocks.add(block);
         }
         executableBlocks.sort(Comparator.comparing(MemoryBlock::getStart));
-        for (MemoryBlock block : executableBlocks) {
-            if (!block.isInitialized() || !block.isExecute()) continue;
-            Address end = block.getEnd();
-            Address address = block.getStart();
+        // Analyzed instructions already contribute their CALL/JMP targets via
+        // discoverAnalyzedReferences(), so only code units nobody defined are swept.
+        long sweepPhase = System.nanoTime();
+        AddressSet executable = new AddressSet();
+        for (MemoryBlock block : executableBlocks) executable.add(block.getStart(), block.getEnd());
+        for (AddressRange range : listing.getUndefinedRanges(executable, true, monitor)) {
+            sweepRanges++;
+            sweepBytes += range.getLength();
+            Address end = range.getMaxAddress();
+            Address address = range.getMinAddress();
             while (address.compareTo(end) <= 0) {
                 if (nativeInstructions != 0 && nativeInstructions % 100_000 == 0) {
                     monitor.checkCancelled();
@@ -1234,11 +1442,19 @@ public class ApplyFlirtSignatures extends GhidraScript {
                 catch (Exception exception) { break; }
             }
         }
+        sweepNanos = System.nanoTime() - sweepPhase;
+        long step = System.nanoTime();
         discoverAnalyzedReferences();
+        referenceNanos = System.nanoTime() - step;
+        step = System.nanoTime();
         discoverRelocations();
-        discoverDefinedPointers();
+        relocationNanos = System.nanoTime() - step;
+        step = System.nanoTime();
         discoverPointerTables();
+        pointerTableNanos = System.nanoTime() - step;
+        step = System.nanoTime();
         discoverInitialBoundaries();
+        boundaryNanos = System.nanoTime() - step;
         long anchorPhase = System.nanoTime();
         discoverSignatureAnchorCandidates();
         anchorScanNanos = System.nanoTime() - anchorPhase;
@@ -1256,8 +1472,11 @@ public class ApplyFlirtSignatures extends GhidraScript {
             if (bytes.length < SIG_ANCHOR_BYTES) continue;
             long key = anchorKey(bytes, 0);
             for (int end = SIG_ANCHOR_BYTES - 1; end < bytes.length; end++) {
+                if ((end & 0xfffff) == 0) monitor.checkCancelled();
                 if (end >= SIG_ANCHOR_BYTES)
                     key = (key << 8) | (bytes[end] & 0xffL);
+                int bit = anchorFilterBit(key);
+                if ((anchorFilter[bit >>> 6] & (1L << bit)) == 0) continue;
                 List<AnchorProbe> probes = rareAnchorIndex.get(key);
                 if (probes == null) continue;
                 sigAnchorRawHits++;
@@ -1281,7 +1500,6 @@ public class ApplyFlirtSignatures extends GhidraScript {
                     if (listing.getDefinedDataContaining(candidate) != null) continue;
                     found.put(candidate.getOffset(), candidate);
                 }
-                if ((end & 0xfffff) == 0) monitor.checkCancelled();
             }
             monitor.setMessage(String.format(
                 "Apply FLIRT Signatures: SIG anchor scan %,d/%,d, %,d bytes, %,d candidates",
@@ -1361,8 +1579,13 @@ public class ApplyFlirtSignatures extends GhidraScript {
                     }
                     else {
                         sawReference |= addCandidate(destination, SOURCE_REFERENCE);
+                        // Ghidra gives every pointer it defines, nested ones
+                        // included, a reference to its target, so the typed
+                        // pointers are found here without walking all data.
                         Data data = listing.getDataContaining(source);
-                        if (data != null && data.isPointer()) {
+                        Data primitive = data == null ? null :
+                            data.getPrimitiveAt((int)source.subtract(data.getMinAddress()));
+                        if (primitive != null && primitive.isPointer()) {
                             if (addCandidate(destination, SOURCE_TYPED_POINTER))
                                 typedPointerCandidates++;
                         }
@@ -1405,35 +1628,6 @@ public class ApplyFlirtSignatures extends GhidraScript {
         }
         catch (Exception exception) {
             printerr("Apply FLIRT Signatures: relocation discovery incomplete: " + exception);
-        }
-    }
-
-    private void discoverDefinedPointers() {
-        try {
-            DataIterator roots = listing.getDefinedData(true);
-            int examined = 0;
-            while (roots.hasNext() && examined < MAX_POINTER_SLOTS) {
-                Deque<Data> work = new ArrayDeque<>();
-                work.push(roots.next());
-                while (!work.isEmpty() && examined++ < MAX_POINTER_SLOTS) {
-                    Data data = work.pop();
-                    try {
-                        if (data.isPointer() && data.getValue() instanceof Address) {
-                            if (addCandidate((Address)data.getValue(), SOURCE_TYPED_POINTER))
-                                typedPointerCandidates++;
-                        }
-                    }
-                    catch (Exception ignored) { }
-                    int count = Math.min(4096, Math.max(0, data.getNumComponents()));
-                    for (int i = 0; i < count; i++) {
-                        Data child = data.getComponent(i);
-                        if (child != null) work.push(child);
-                    }
-                }
-            }
-        }
-        catch (Exception exception) {
-            printerr("Apply FLIRT Signatures: typed-pointer discovery incomplete: " + exception);
         }
     }
 
@@ -1489,6 +1683,7 @@ public class ApplyFlirtSignatures extends GhidraScript {
         int width = currentProgram.getDefaultPointerSize();
         if (width != 4 && width != 8) return;
         boolean bigEndian = memory.isBigEndian();
+        long[][] executable = executableRanges();
         long scanned = 0;
         try {
             for (MemoryBlock block : memory.getBlocks()) {
@@ -1518,11 +1713,9 @@ public class ApplyFlirtSignatures extends GhidraScript {
                             for (int i = width - 1; i >= 0; i--)
                                 value = (value << 8) | (bytes[cell * width + i] & 0xffL);
                         }
-                        Address target = toAddr(value);
-                        MemoryBlock targetBlock = target == null ? null : memory.getBlock(target);
-                        if (targetBlock != null && targetBlock.isInitialized() && targetBlock.isExecute()) {
-                            run.add(target);
-                        }
+                        // Most cells are not code pointers; test the raw value
+                        // before building an Address or asking Memory for a block.
+                        if (insideRanges(executable, value)) run.add(toAddr(value));
                         else {
                             commitPointerRun(run);
                             run.clear();
@@ -1539,6 +1732,31 @@ public class ApplyFlirtSignatures extends GhidraScript {
             printerr("Apply FLIRT Signatures: pointer-table discovery incomplete: " + exception);
         }
         pointerSlotsScanned = scanned;
+    }
+
+    /** Sorted offsets [start, end] of initialized executable blocks in the default space. */
+    private long[][] executableRanges() {
+        AddressSpace space = currentProgram.getAddressFactory().getDefaultAddressSpace();
+        List<long[]> ranges = new ArrayList<>();
+        for (MemoryBlock block : memory.getBlocks()) {
+            if (!block.isInitialized() || !block.isExecute() ||
+                !block.getStart().getAddressSpace().equals(space)) continue;
+            ranges.add(new long[] { block.getStart().getOffset(), block.getEnd().getOffset() });
+        }
+        ranges.sort((left, right) -> Long.compareUnsigned(left[0], right[0]));
+        return ranges.toArray(new long[0][]);
+    }
+
+    private static boolean insideRanges(long[][] ranges, long value) {
+        int low = 0;
+        int high = ranges.length - 1;
+        while (low <= high) {
+            int middle = (low + high) >>> 1;
+            if (Long.compareUnsigned(value, ranges[middle][0]) < 0) high = middle - 1;
+            else if (Long.compareUnsigned(value, ranges[middle][1]) > 0) low = middle + 1;
+            else return true;
+        }
+        return false;
     }
 
     private void commitPointerRun(List<Address> run) {
@@ -1560,14 +1778,17 @@ public class ApplyFlirtSignatures extends GhidraScript {
     private List<Address> terminalBoundaryCandidates(Function function) {
         List<Address> result = new ArrayList<>();
         try {
-            PseudoDisassembler pseudo = new PseudoDisassembler(currentProgram);
-            pseudo.setRespectExecuteFlag(true);
-            InstructionIterator iterator = listing.getInstructions(function.getBody(), true);
-            while (iterator.hasNext()) {
-                Instruction instruction = iterator.next();
-                if (!instruction.getMaxAddress().equals(function.getBody().getMaxAddress())) continue;
+            if (boundaryPseudo == null) {
+                boundaryPseudo = new PseudoDisassembler(currentProgram);
+                boundaryPseudo.setRespectExecuteFlag(true);
+            }
+            PseudoDisassembler pseudo = boundaryPseudo;
+            Address bodyEnd = function.getBody().getMaxAddress();
+            Instruction last = bodyEnd == null ? null : listing.getInstructionContaining(bodyEnd);
+            for (Instruction instruction : last == null ? List.<Instruction>of() : List.of(last)) {
+                if (!instruction.getMaxAddress().equals(bodyEnd)) continue;
                 FlowType flow = instruction.getFlowType();
-                boolean terminal = flow.isTerminal() ||
+                boolean terminal = flow.isTerminal() || trapInstruction(instruction) ||
                     (flow.isJump() && flow.isUnConditional() && !flow.isComputed() &&
                      instruction.getFallThrough() == null);
                 if (!terminal) continue;
@@ -1578,6 +1799,9 @@ public class ApplyFlirtSignatures extends GhidraScript {
                 Address candidate = toAddr(alignedOffset);
                 MemoryBlock block = memory.getBlock(candidate);
                 if (block == null || !block.isInitialized() || !block.isExecute()) continue;
+                // Usually the next function already starts here; test that
+                // before the padding decode and the costly subroutine check.
+                if (functions.getFunctionContaining(candidate) != null) continue;
                 if (listing.getDefinedDataContaining(candidate) != null) continue;
                 Address padding = after;
                 boolean validPadding = true;
@@ -1594,7 +1818,6 @@ public class ApplyFlirtSignatures extends GhidraScript {
                 }
                 if (!validPadding || !pseudo.checkValidSubroutine(candidate, true, true, false))
                     continue;
-                if (functions.getFunctionContaining(candidate) != null) continue;
                 result.add(candidate);
             }
         }
@@ -1621,19 +1844,19 @@ public class ApplyFlirtSignatures extends GhidraScript {
                 sigAnchorSignatureHits++;
                 site.sources |= SOURCE_SIG_ANCHOR_VERIFIED;
                 List<MatchResult> verified = new ArrayList<>();
+                boolean anyCreatable = false;
                 for (MatchResult match : matches) {
                     Module module = match.module;
-                    boolean strong = module.fixedBytes >= MIN_CREATE_FIXED;
-                    boolean corroborated = module.fixedBytes >= MIN_CREATE_CORROBORATED &&
-                        (module.crcLength >= MIN_CRC || !module.tails.isEmpty());
-                    if (!(strong || corroborated)) continue;
+                    if (!creatableModule(module)) continue;
+                    anyCreatable = true;
                     StructuralEvidence evidence = structuralEvidence(site, module);
                     if (evidence.validSubroutine && evidence.allPathsClosed &&
                         evidence.terminalExact) verified.add(match);
                 }
                 if (verified.isEmpty()) {
                     site.sources &= ~SOURCE_SIG_ANCHOR_VERIFIED;
-                    sigAnchorCfgRejected++;
+                    if (anyCreatable) sigAnchorCfgRejected++;
+                    else sigAnchorWeakRejected++;
                     continue;
                 }
                 matches = verified;
@@ -1705,12 +1928,12 @@ public class ApplyFlirtSignatures extends GhidraScript {
                 Address source = site.address.add(signed);
                 Instruction instruction = listing.getInstructionContaining(source);
                 if (instruction == null) continue;
+                String expected = canonicalIdentity(reference.name);
                 for (Address target : instruction.getFlows()) {
                     Function function = functions.getFunctionAt(target);
                     if (function == null || function.getSymbol() == null ||
                         function.getSymbol().getSource() == SourceType.DEFAULT) continue;
-                    if (canonicalIdentity(reference.name).equals(
-                        canonicalIdentity(function.getName()))) count++;
+                    if (namedIdentitiesAt(target).contains(expected)) count++;
                 }
             }
             catch (Exception ignored) { }
@@ -1718,9 +1941,27 @@ public class ApplyFlirtSignatures extends GhidraScript {
         return count;
     }
 
-    private final Map<String, StructuralEvidence> structuralCache = new HashMap<>();
-    private final Map<String, Address> sigReferenceTargetCache = new HashMap<>();
-    private final Set<String> sigReferenceTargetMisses = new HashSet<>();
+    /**
+     * Canonical identities of every non-default symbol at an address.  A
+     * demangled Rust function shows only its short name, so its exact mangled
+     * identity lives in the library-namespace label added beside it.
+     */
+    private Set<String> namedIdentitiesAt(Address address) {
+        Set<String> result = new HashSet<>();
+        try {
+            for (Symbol symbol : symbols.getSymbols(address)) {
+                if (symbol.getSource() == SourceType.DEFAULT) continue;
+                String identity = canonicalIdentity(symbol.getName());
+                if (identity != null) result.add(identity);
+            }
+        }
+        catch (Exception ignored) { }
+        return result;
+    }
+
+    private final Map<EvidenceKey, StructuralEvidence> structuralCache = new HashMap<>();
+    private final Map<ReferenceKey, Address> sigReferenceTargetCache = new HashMap<>();
+    private final Set<ReferenceKey> sigReferenceTargetMisses = new HashSet<>();
     private final Map<Long, PseudoInstruction> structuralInstructionCache = new HashMap<>();
     private final Set<Long> structuralDecodeFailureCache = new HashSet<>();
     private final Map<Long, Boolean> validSubroutineCache = new HashMap<>();
@@ -1739,7 +1980,7 @@ public class ApplyFlirtSignatures extends GhidraScript {
     }
 
     private StructuralEvidence structuralEvidence(Site site, Module module) {
-        String key = site.address.getOffset() + ":" + module.length + ":" + site.sources;
+        EvidenceKey key = new EvidenceKey(site.address.getOffset(), module.length, site.sources);
         StructuralEvidence cached = structuralCache.get(key);
         if (cached != null) return cached;
         StructuralEvidence result = new StructuralEvidence();
@@ -1771,7 +2012,8 @@ public class ApplyFlirtSignatures extends GhidraScript {
             long end = start + module.length - 1;
             Deque<Address> work = new ArrayDeque<>();
             Set<Long> visited = new HashSet<>();
-            List<long[]> ranges = new ArrayList<>();
+            // Bytes already claimed by a decoded instruction, relative to start.
+            BitSet occupied = new BitSet((int)module.length);
             Set<Long> terminalEnds = new HashSet<>();
             result.reachableBody = new AddressSet();
             work.push(site.address);
@@ -1788,20 +2030,18 @@ public class ApplyFlirtSignatures extends GhidraScript {
                 int size = instruction.getLength();
                 long instructionEnd = cursorOffset + size - 1;
                 if (size <= 0 || instructionEnd > end) { closed = false; break; }
-                for (long[] range : ranges) {
-                    if (!(instructionEnd < range[0] || cursorOffset > range[1])) {
-                        closed = false;
-                        break;
-                    }
-                }
-                if (!closed) break;
-                ranges.add(new long[] { cursorOffset, instructionEnd });
+                int relativeStart = (int)(cursorOffset - start);
+                int relativeEnd = (int)(instructionEnd - start);
+                int claimed = occupied.nextSetBit(relativeStart);
+                if (claimed >= 0 && claimed <= relativeEnd) { closed = false; break; }
+                occupied.set(relativeStart, relativeEnd + 1);
                 result.reachableBody.add(cursor, cursor.add(size - 1L));
                 result.maxInstructionEnd = Math.max(result.maxInstructionEnd, instructionEnd);
                 FlowType flow = instruction.getFlowType();
                 Address fall = instruction.getFallThrough();
                 boolean terminalHere = false;
-                if (flow.isComputed() && flow.isJump()) {
+                if (trapInstruction(instruction)) terminalHere = true;
+                else if (flow.isComputed() && flow.isJump()) {
                     result.computedJumpSeen = true;
                     Instruction analyzed = listing.getInstructionAt(cursor);
                     if (analyzed == null || analyzed.getLength() != size ||
@@ -1957,6 +2197,17 @@ public class ApplyFlirtSignatures extends GhidraScript {
         catch (Exception exception) { return false; }
     }
 
+    /**
+     * Trap instructions end a path.  Ghidra's x86 SLEIGH models UD0/UD1/UD2 as
+     * an indirect branch with no targets, and rustc emits UD2 at unreachable
+     * points such as after a call that cannot return, so treating them as
+     * unresolved switches would reject most Rust function bodies.  AArch64 BRK
+     * and ARM/AArch64 UDF are LLVM's trap encodings on those targets.
+     */
+    private static boolean trapInstruction(Instruction instruction) {
+        return TRAP_MNEMONICS.contains(instruction.getMnemonicString().toUpperCase(Locale.ROOT));
+    }
+
     private static boolean inside(Address address, long start, long end) {
         long value = address.getOffset();
         return value >= start && value <= end;
@@ -2041,14 +2292,25 @@ public class ApplyFlirtSignatures extends GhidraScript {
      */
     private void resolveBySigReferenceGraph() throws Exception {
         if (!ENABLE_SIG_REFERENCE_GRAPH || ambiguousSites.isEmpty()) return;
+        // Only sites whose candidates carry reference records can add or
+        // check an edge; survivors only shrink, so this list stays complete.
+        List<Site> graphSources = new ArrayList<>();
+        for (Site site : sites.values()) {
+            for (MatchResult candidate : site.survivors) {
+                if (!candidate.module.expectedRefs().isEmpty()) {
+                    graphSources.add(site);
+                    break;
+                }
+            }
+        }
         Set<Long> narrowedSites = new HashSet<>();
-        for (int round = 1; round <= 32; round++) {
+        for (int round = 1; round <= 32 && !graphSources.isEmpty(); round++) {
             monitor.checkCancelled();
             Map<Site, Set<MatchResult>> removals = new HashMap<>();
 
             // Outgoing consistency: a candidate that explicitly names a
             // target must be supported by that target's current candidates.
-            for (Site source : sites.values()) {
+            for (Site source : graphSources) {
                 if (source.survivors.isEmpty()) continue;
                 for (MatchResult candidate : source.survivors) {
                     if (!candidateGraphCompatible(source, candidate))
@@ -2060,16 +2322,11 @@ public class ApplyFlirtSignatures extends GhidraScript {
             // Incoming consistency is used only when every candidate at the
             // source records the same concrete edge.  A candidate lacking the
             // record makes the edge incomplete and therefore non-pruning.
-            for (Site source : sites.values()) {
+            for (Site source : graphSources) {
                 if (source.survivors.isEmpty()) continue;
                 Set<Long> offsets = new HashSet<>();
-                for (MatchResult candidate : source.survivors) {
-                    for (PublicSymbol reference : candidate.module.refs) {
-                        String expected = canonicalIdentity(reference.name);
-                        if (expected == null || expected.equals("?")) continue;
-                        offsets.add(reference.negative ? -reference.offset : reference.offset);
-                    }
-                }
+                for (MatchResult candidate : source.survivors)
+                    offsets.addAll(candidate.module.expectedRefs().keySet());
                 for (long signedOffset : offsets) {
                     Address target = directSigReferenceTarget(source, signedOffset);
                     if (target == null) continue;
@@ -2141,14 +2398,7 @@ public class ApplyFlirtSignatures extends GhidraScript {
     }
 
     private boolean candidateGraphCompatible(Site source, MatchResult candidate) {
-        Map<Long, Set<String>> expectedByOffset = new HashMap<>();
-        for (PublicSymbol reference : candidate.module.refs) {
-            String expected = canonicalIdentity(reference.name);
-            if (expected == null || expected.equals("?")) continue;
-            long signed = reference.negative ? -reference.offset : reference.offset;
-            expectedByOffset.computeIfAbsent(signed, ignored -> new HashSet<>()).add(expected);
-        }
-        for (Map.Entry<Long, Set<String>> entry : expectedByOffset.entrySet()) {
+        for (Map.Entry<Long, Set<String>> entry : candidate.module.expectedRefs().entrySet()) {
             Address target = directSigReferenceTarget(source, entry.getKey());
             if (target == null) continue;
             Set<String> targetDomain = graphIdentitiesAt(target);
@@ -2181,18 +2431,11 @@ public class ApplyFlirtSignatures extends GhidraScript {
     }
 
     private static Set<String> expectedReferencesAt(Module module, long signedOffset) {
-        Set<String> result = new HashSet<>();
-        for (PublicSymbol reference : module.refs) {
-            long signed = reference.negative ? -reference.offset : reference.offset;
-            if (signed != signedOffset) continue;
-            String identity = canonicalIdentity(reference.name);
-            if (identity != null && !identity.equals("?")) result.add(identity);
-        }
-        return result;
+        return module.expectedRefs().getOrDefault(signedOffset, Collections.emptySet());
     }
 
     private Address directSigReferenceTarget(Site source, long signedOffset) {
-        String key = source.address.getOffset() + ":" + signedOffset;
+        ReferenceKey key = new ReferenceKey(source.address.getOffset(), signedOffset);
         Address cached = sigReferenceTargetCache.get(key);
         if (cached != null) return cached;
         if (sigReferenceTargetMisses.contains(key)) return null;
@@ -2444,14 +2687,74 @@ public class ApplyFlirtSignatures extends GhidraScript {
         for (PublicSymbol symbol : module.publics) {
             if (symbol.name.isEmpty() || symbol.name.equals("?") ||
                 symbol.collision) continue;
-            try {
-                renameAt(site.address.add(symbol.offset), symbol.name, true,
-                    symbol.offset != 0);
-            }
+            try { applyPublic(site, symbol, symbol.name, true); }
             catch (Exception exception) {
                 errors++;
                 printerr("Apply FLIRT Signatures: rename target failed: " + exception);
             }
+        }
+    }
+
+    /**
+     * Apply one module public.  The entry public names the site's function.
+     * A public at another offset becomes a function only when the address has
+     * its own entry evidence and lies outside every existing function;
+     * otherwise it is recorded as a label, because a secondary public is just
+     * as often an alternate entry or a local symbol inside the same body.
+     */
+    private void applyPublic(Site site, PublicSymbol symbol, String rawName,
+                             boolean allowCreatePrimary) {
+        Address address = site.address.add(symbol.offset);
+        if (symbol.offset == 0) {
+            renameAt(address, rawName, allowCreatePrimary);
+            return;
+        }
+        if (functions.getFunctionAt(address) != null) {
+            renameAt(address, rawName, false);
+            return;
+        }
+        if (independentFunctionStart(address) &&
+            functions.getFunctionContaining(address) == null &&
+            listing.getDefinedDataContaining(address) == null) {
+            if (dryRun) {
+                secondaryPublicFunctions++;
+                dryRunFunctionSites.add(address.getOffset());
+                functionsCreated++;
+                renamed++;
+                appliedFunctionSites.add(address.getOffset());
+                return;
+            }
+            Function created = createFunctionAt(address);
+            if (created != null) {
+                secondaryPublicFunctions++;
+                renameAt(address, rawName, false);
+                return;
+            }
+        }
+        applySecondaryLabel(address, rawName);
+    }
+
+    private boolean independentFunctionStart(Address address) {
+        Integer sources = discoveredSources.get(address.getOffset());
+        return sources != null && strongFunctionOrigin(sources);
+    }
+
+    private void applySecondaryLabel(Address address, String rawName) {
+        String canonical = canonicalIdentity(rawName);
+        if (canonical == null || canonical.isEmpty()) return;
+        try {
+            for (Symbol existing : symbols.getSymbols(address)) {
+                if (existing.getName().equals(canonical)) {
+                    secondaryPublicLabelsExisting++;
+                    return;
+                }
+            }
+            if (!dryRun) symbols.createLabel(address, canonical, libraryNamespace,
+                SourceType.ANALYSIS);
+            secondaryPublicLabels++;
+        }
+        catch (Exception exception) {
+            secondaryPublicLabelErrors++;
         }
     }
 
@@ -2480,22 +2783,17 @@ public class ApplyFlirtSignatures extends GhidraScript {
             PublicSymbol symbol = representative.get(record);
             if (!allowCreatePrimary && symbol.offset == 0 &&
                 functions.getFunctionAt(site.address) == null) continue;
-            try { renameAt(site.address.add(symbol.offset), symbol.name,
-                allowCreatePrimary, symbol.offset != 0); }
+            try { applyPublic(site, symbol, symbol.name, allowCreatePrimary); }
             catch (Exception exception) { errors++; }
         }
     }
 
     private Function createFunctionAt(Address address) {
-        return createFunctionAt(address, false);
-    }
-
-    private Function createFunctionAt(Address address, boolean allowContained) {
         if (dryRun) return null;
         try {
             Function exact = functions.getFunctionAt(address);
             if (exact != null) return exact;
-            if (!allowContained && functions.getFunctionContaining(address) != null) return null;
+            if (functions.getFunctionContaining(address) != null) return null;
             if (listing.getInstructionAt(address) == null) disassemble(address);
             exact = functions.getFunctionAt(address);
             if (exact == null) exact = createFunction(address, null);
@@ -2506,14 +2804,30 @@ public class ApplyFlirtSignatures extends GhidraScript {
     }
 
     private void renameAt(Address address, String rawName, boolean allowCreate) {
-        renameAt(address, rawName, allowCreate, false);
+        renameAt(address, rawName, allowCreate, null);
     }
 
+    /**
+     * Name the function at address.  hashVariants lists every legacy Rust
+     * identity that demangles to the same name; the applied name then claims
+     * none of their hashes.
+     */
     private void renameAt(Address address, String rawName, boolean allowCreate,
-                          boolean allowContainedCreate) {
+                          List<String> hashVariants) {
         Function function = functions.getFunctionAt(address);
+        if (function == null && dryRun) {
+            // A preview creates nothing, so count what the real run would do.
+            if (dryRunFunctionSites.contains(address.getOffset())) alreadyCorrect++;
+            else if (allowCreate && wouldCreateFunction(address)) {
+                dryRunFunctionSites.add(address.getOffset());
+                functionsCreated++;
+                renamed++;
+                appliedFunctionSites.add(address.getOffset());
+            }
+            return;
+        }
         if (function == null && allowCreate)
-            function = createFunctionAt(address, allowContainedCreate);
+            function = createFunctionAt(address);
         if (function == null) return;
         Symbol symbol = function.getSymbol();
         SourceType source = symbol == null ? SourceType.DEFAULT : symbol.getSource();
@@ -2523,11 +2837,51 @@ public class ApplyFlirtSignatures extends GhidraScript {
         }
         String canonical = canonicalIdentity(rawName);
         if (canonical == null || canonical.isEmpty()) return;
-        if (canonical.equals(function.getName()) &&
-            function.getParentNamespace() == libraryNamespace) {
+        // A name from an earlier signature is not this run's to replace: the
+        // same identity is already correct, a different one is a conflict.
+        String[] recorded = recordedIdentity(address);
+        if (recorded != null) {
+            boolean sameLibrary = recorded[0].equals(libraryKey);
+            if (recorded[1].startsWith(AMBIGUOUS_RECORD)) {
+                // An earlier approximate alias yields only to an exact name
+                // with the same meaning, e.g. basic_filebuf::imbue.
+                String meaning = recorded[1].substring(AMBIGUOUS_RECORD.length());
+                if (!sameLibrary && !meaning.equals(semanticIdentity(canonical))) {
+                    recordSignatureConflict(address, recorded, canonical);
+                    return;
+                }
+            }
+            else if (sameIdentity(recorded[1], canonical)) {
+                alreadyCorrect++;
+                appliedFunctionSites.add(address.getOffset());
+                return;
+            }
+            else if (!sameLibrary) {
+                recordSignatureConflict(address, recorded, canonical);
+                return;
+            }
+        }
+        if (alreadyNamed(function, address, canonical, hashVariants) ||
+            (source != SourceType.DEFAULT && sameDemangledLeaf(function, canonical))) {
             alreadyCorrect++;
             appliedFunctionSites.add(address.getOffset());
+            recordIdentity(address, canonical);
             return;
+        }
+        // Loader, export and PDB names outrank a signature match, except a
+        // loader placeholder facing a strong match.
+        if (source == SourceType.IMPORTED) {
+            if (sameIdentity(function.getName(), canonical)) {
+                alreadyCorrect++;
+                appliedFunctionSites.add(address.getOffset());
+                recordIdentity(address, canonical);
+                return;
+            }
+            if (!strongPlaceholderMatch(function, address, canonical)) {
+                keepImportedName(function, address, canonical);
+                return;
+            }
+            placeholderNamesReplaced++;
         }
         if (dryRun) {
             renamed++;
@@ -2536,18 +2890,20 @@ public class ApplyFlirtSignatures extends GhidraScript {
         }
         try {
             boolean demangled = false;
-            if (isLegacyRust(canonical)) {
-                demangled = applyRustDemangled(address, canonical);
+            boolean rust = isRustMangled(canonical);
+            if (rust) {
+                // The demangler knows no stdcall @n tail; the label keeps it.
+                demangled = applyRustDemangled(address,
+                    STDCALL_SUFFIX.matcher(canonical).replaceFirst(""));
                 if (demangled) rustNamesDemangled++;
                 else rustDemangleFailed++;
             }
-            if (!demangled) {
-                function.setName(canonical, SourceType.ANALYSIS);
-                if (libraryNamespace != null && function.getParentNamespace() != libraryNamespace)
-                    function.setParentNamespace(libraryNamespace);
-            }
+            if (!demangled) setLibraryName(function, address,
+                hashVariants == null ? canonical : hashlessIdentity(canonical));
             if (!canonical.equals(rawName)) rustNamesRestored++;
-            if (isLegacyRust(canonical)) preserveRustIdentity(address, rawName, canonical);
+            if (hashVariants != null) recordHashVariants(address, canonical, hashVariants);
+            else if (rust) preserveRustIdentity(address, rawName, canonical);
+            recordIdentity(address, canonical);
             renamed++;
             appliedFunctionSites.add(address.getOffset());
             logChange(String.format("  %s : %s", address, canonical));
@@ -2556,6 +2912,198 @@ public class ApplyFlirtSignatures extends GhidraScript {
             errors++;
             printerr("Apply FLIRT Signatures: rename failed " + address + " -> " + canonical + ": " + exception);
         }
+    }
+
+    private boolean wouldCreateFunction(Address address) {
+        MemoryBlock block = memory.getBlock(address);
+        return block != null && block.isInitialized() && block.isExecute() &&
+            functions.getFunctionContaining(address) == null &&
+            listing.getDefinedDataContaining(address) == null;
+    }
+
+    /** {library, identity} recorded by an earlier run at this entry, or null. */
+    private String[] recordedIdentity(Address address) {
+        if (identityRecords == null)
+            identityRecords = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap(IDENTITY_PROPERTY);
+        String value = identityRecords == null ? null : identityRecords.getString(address);
+        int tab = value == null ? -1 : value.indexOf('\t');
+        return tab < 0 ? null : new String[] { value.substring(0, tab), value.substring(tab + 1) };
+    }
+
+    private void recordIdentity(Address address, String identity) {
+        if (dryRun) return;
+        try {
+            if (identityRecords == null) {
+                identityRecords = currentProgram.getUsrPropertyManager()
+                    .getStringPropertyMap(IDENTITY_PROPERTY);
+                if (identityRecords == null)
+                    identityRecords = currentProgram.getUsrPropertyManager()
+                        .createStringPropertyMap(IDENTITY_PROPERTY);
+            }
+            identityRecords.add(address, libraryKey + "\t" + identity);
+        }
+        catch (Exception exception) { errors++; }
+    }
+
+    /**
+     * Identities that name the same function: equal after Rust hash removal,
+     * or for C names after dropping leading underscores and the @n stdcall
+     * suffix, so memcpy_s from two libraries or _exit and exit agree.
+     */
+    private static boolean sameIdentity(String left, String right) {
+        if (left == null || right == null) return false;
+        return left.equals(right) || looseIdentity(left).equals(looseIdentity(right));
+    }
+
+    private static String looseIdentity(String name) {
+        String canonical = canonicalIdentity(name);
+        String hashless = hashlessIdentity(canonical);
+        if (hashless != null) return hashless;
+        int start = 0;
+        while (start < canonical.length() && canonical.charAt(start) == '_') start++;
+        return canonical.substring(start).replaceFirst("@[0-9]+$", "");
+    }
+
+    /**
+     * Ghidra's own name for the function, often demangled from a symbol, is
+     * the demangled leaf of the MSVC identity: ~sentry for
+     * ??1sentry@?$basic_ostream@...  Replacing it would only trade a readable
+     * name for the decorated one.
+     */
+    private static boolean sameDemangledLeaf(Function function, String canonical) {
+        if (!canonical.startsWith("?")) return false;
+        String[] parts = msvcSemanticParts(canonical);
+        if (parts == null) return false;
+        String leaf = stripTemplateArguments(function.getName())
+            .replace("`", "").replace("'", "").trim();
+        return parts[1].equals(leaf);
+    }
+
+    /**
+     * entry and tls_callback_<n> are names the loader invents, not names the
+     * program carries.  tls_callback_0 of a Rust binary is matched STRONG as
+     * std::sys::windows::thread_local_key::on_tls_callback, while a short
+     * structural match of AfxAbort at an MSVC entry is not enough.
+     */
+    private boolean strongPlaceholderMatch(Function function, Address address,
+                                           String canonical) {
+        if (!LOADER_PLACEHOLDER.matcher(function.getName()).matches()) return false;
+        Site site = sites.get(address.getOffset());
+        if (site == null) return false;
+        for (MatchResult match : site.survivors) {
+            if (!canonical.equals(canonicalIdentity(match.module.primaryName()))) continue;
+            Decision decision = confidence(site, match, false);
+            if (decision == Decision.STRONG || decision == Decision.CRC_TAIL) return true;
+        }
+        return false;
+    }
+
+    private void keepImportedName(Function function, Address address, String canonical) {
+        importedNamesKept++;
+        importedNameSites.add(new String[] { address.toString(), function.getName(true), canonical });
+        if (dryRun) return;
+        String note = "FLIRT " + libraryKey + " match (imported name kept): " + canonical;
+        try {
+            String previous = listing.getComment(CodeUnit.REPEATABLE_COMMENT, address);
+            if (previous == null) previous = "";
+            if (!previous.contains(note))
+                listing.setComment(address, CodeUnit.REPEATABLE_COMMENT,
+                    (previous + "\n" + note).trim());
+        }
+        catch (Exception exception) { errors++; }
+    }
+
+    /** Keep the earlier signature's name and leave the disagreement for review. */
+    private void recordSignatureConflict(Address address, String[] recorded, String canonical) {
+        signatureConflicts++;
+        signatureConflictSites.add(new String[] {
+            address.toString(), recorded[0], recorded[1], libraryKey, canonical });
+        if (dryRun) return;
+        String note = "FLIRT signature conflict\nkept: " + recorded[1] + " (" + recorded[0] +
+            ")\nalso matched: " + canonical + " (" + libraryKey + ")";
+        try {
+            String previous = listing.getComment(CodeUnit.REPEATABLE_COMMENT, address);
+            if (previous == null) previous = "";
+            if (!previous.contains("also matched: " + canonical + " (" + libraryKey + ")"))
+                listing.setComment(address, CodeUnit.REPEATABLE_COMMENT,
+                    (previous + "\n" + note).trim());
+            currentProgram.getBookmarkManager().setBookmark(address, "Analysis",
+                "FLIRT/Ambiguous", note.replace('\n', ' '));
+        }
+        catch (Exception exception) { errors++; }
+    }
+
+    /**
+     * Set the name and the library namespace in one step.  Renaming first in
+     * the current namespace collides with a same-named label there, which is
+     * common at MSVC entries that already carry their decorated name.
+     */
+    private void setLibraryName(Function function, Address address, String name)
+            throws Exception {
+        Symbol symbol = function.getSymbol();
+        Namespace target = libraryNamespace != null ? libraryNamespace :
+            function.getParentNamespace();
+        try {
+            symbol.setNameAndNamespace(name, target, SourceType.ANALYSIS);
+        }
+        catch (DuplicateNameException exception) {
+            // Only a label of exactly this name in the same namespace and at the
+            // same address can collide; the function name supersedes it.
+            for (Symbol other : symbols.getSymbols(address)) {
+                if (!other.equals(symbol) && other.getSymbolType() == SymbolType.LABEL &&
+                    other.getName().equals(name) && target.equals(other.getParentNamespace()))
+                    other.delete();
+            }
+            symbol.setNameAndNamespace(name, target, SourceType.ANALYSIS);
+        }
+    }
+
+    /**
+     * True when the function already carries the identity: a previous run
+     * named it, or the program holds the exact name as another symbol at the
+     * entry.  The second case covers a demangled Rust function beside its
+     * preserved label and an MSVC function such as operator_new whose
+     * decorated name ??2@YAPAXI@Z is already a label; renaming it would only
+     * replace a readable name with the decorated one.
+     */
+    private boolean alreadyNamed(Function function, Address address, String canonical,
+                                 List<String> hashVariants) {
+        if (canonical.equals(function.getName()) && libraryNamespace != null &&
+            libraryNamespace.equals(function.getParentNamespace())) return true;
+        Symbol functionSymbol = function.getSymbol();
+        if (functionSymbol == null || functionSymbol.getSource() == SourceType.DEFAULT)
+            return false;
+        if (hashVariants != null) {
+            String comment = listing.getComment(CodeUnit.REPEATABLE_COMMENT, address);
+            return comment != null && comment.contains(hashVariantMarker(canonical));
+        }
+        for (Symbol item : symbols.getSymbols(address)) {
+            if (!item.equals(functionSymbol) && item.getName().equals(canonical)) return true;
+        }
+        return false;
+    }
+
+    private static String hashVariantMarker(String canonical) {
+        return "FLIRT Rust hash variants of " + hashlessIdentity(canonical);
+    }
+
+    private void recordHashVariants(Address address, String canonical,
+                                    List<String> hashVariants) {
+        try {
+            String previous = listing.getComment(CodeUnit.REPEATABLE_COMMENT, address);
+            if (previous == null) previous = "";
+            String marker = hashVariantMarker(canonical);
+            if (previous.contains(marker)) return;
+            StringBuilder note = new StringBuilder(marker).append(" (same demangled name):");
+            for (int index = 0; index < Math.min(12, hashVariants.size()); index++)
+                note.append('\n').append(hashVariants.get(index));
+            if (hashVariants.size() > 12)
+                note.append("\n... ").append(hashVariants.size() - 12).append(" more");
+            listing.setComment(address, CodeUnit.REPEATABLE_COMMENT,
+                (previous + "\n" + note).trim());
+        }
+        catch (Exception ignored) { }
     }
 
     private void logChange(String message) {
@@ -2641,6 +3189,35 @@ public class ApplyFlirtSignatures extends GhidraScript {
         return parseRustComponents(name) != null;
     }
 
+    /** Legacy (_ZN) or v0 (_R) Rust mangling; Ghidra's RustDemangler takes both. */
+    private static boolean isRustMangled(String name) {
+        return name != null && (isLegacyRust(name) || RUST_V0_PREFIX.matcher(name).find());
+    }
+
+    /** The legacy name without its 17h<hash>E tail and .llvm suffix. */
+    private static String hashlessIdentity(String canonical) {
+        if (canonical == null || !isLegacyRust(canonical)) return null;
+        return RUST_LEGACY_HASH_SUFFIX.matcher(canonical).replaceFirst("E");
+    }
+
+    /**
+     * Whether _uXX_ in a Rizin-sanitized component stood for a $uXX$ escape.
+     * The legacy mangler escapes punctuation and non-ASCII characters only, so
+     * _u64_ in parse_u64_digits or _u128_ in from_u128_le is ordinary text.
+     */
+    private static boolean legacyRustEscape(String hex) {
+        int codePoint;
+        try { codePoint = Integer.parseInt(hex, 16); }
+        catch (NumberFormatException exception) { return false; }
+        if (codePoint < 0x80)
+            return codePoint >= 0x20 && codePoint != 0x7f && codePoint != '_' &&
+                codePoint != '$' && !Character.isLetterOrDigit(codePoint);
+        // An all-decimal hex string (16, 32, 64, 128) is an integer width.
+        return Character.isValidCodePoint(codePoint) &&
+            !(0xD800 <= codePoint && codePoint <= 0xDFFF) &&
+            !hex.chars().allMatch(Character::isDigit);
+    }
+
     private static String canonicalIdentity(String name) {
         if (name == null) return null;
         if (RUST_RESTORE_CACHE.containsKey(name)) return RUST_RESTORE_CACHE.get(name);
@@ -2650,6 +3227,12 @@ public class ApplyFlirtSignatures extends GhidraScript {
     }
 
     private static String computeCanonicalIdentity(String name) {
+        // Rizin turns on_tls_callback...E@12 into ...E_12; restore the @.
+        Matcher stdcall = RUST_SANITIZED_STDCALL.matcher(name);
+        if (stdcall.matches() && parseRustComponents(name) == null) {
+            String restored = stdcall.group(1) + "@" + stdcall.group(2);
+            if (parseRustComponents(restored) != null) name = restored;
+        }
         List<int[]> components = parseRustComponents(name);
         if (components == null) return name;
         String prefix = name.startsWith("__ZN") ? "__ZN" : "_ZN";
@@ -2659,15 +3242,21 @@ public class ApplyFlirtSignatures extends GhidraScript {
         for (int[] range : components) {
             String component = name.substring(range[0], range[1]);
             String restored = component;
-            if (RUST_STRUCTURAL_SANITIZED.matcher(component).find()) {
+            boolean escaped = false;
+            Matcher probe = RUST_UNICODE.matcher(component);
+            while (!escaped && probe.find()) escaped = legacyRustEscape(probe.group(1));
+            if (escaped || RUST_STRUCTURAL_MARKER.matcher(component).find()) {
                 restored = restored.replace("_LT_", "$LT$").replace("_GT_", "$GT$")
                     .replace("_SP_", "$SP$").replace("_BP_", "$BP$")
                     .replace("_RF_", "$RF$").replace("_LP_", "$LP$")
                     .replace("_RP_", "$RP$").replace("_C_", "$C$");
                 Matcher matcher = RUST_UNICODE.matcher(restored);
                 StringBuffer buffer = new StringBuffer();
-                while (matcher.find()) matcher.appendReplacement(buffer,
-                    Matcher.quoteReplacement("$u" + matcher.group(1) + "$"));
+                while (matcher.find()) {
+                    String replacement = legacyRustEscape(matcher.group(1)) ?
+                        "$u" + matcher.group(1) + "$" : matcher.group(0);
+                    matcher.appendReplacement(buffer, Matcher.quoteReplacement(replacement));
+                }
                 matcher.appendTail(buffer);
                 restored = buffer.toString();
             }
@@ -2685,6 +3274,7 @@ public class ApplyFlirtSignatures extends GhidraScript {
         RUST_RESTORE_CACHE.clear();
         RUST_DEMANGLE_CACHE.clear();
         RUST_SEMANTIC_CACHE.clear();
+        MSVC_SEMANTIC_CACHE.clear();
     }
 
     private static void cacheNameResult(Map<String, String> cache,
@@ -2715,8 +3305,57 @@ public class ApplyFlirtSignatures extends GhidraScript {
         if (result.isEmpty() || position >= name.length() || name.charAt(position) != 'E')
             return null;
         String suffix = name.substring(position + 1);
-        if (!suffix.isEmpty() && !suffix.matches("\\.llvm\\.[0-9]+")) return null;
+        if (!suffix.isEmpty() && !suffix.matches("(?:\\.llvm\\.[0-9]+)?(?:@[0-9]+)?")) return null;
         return result;
+    }
+
+    /**
+     * Legacy Rust candidates that differ only in their 17h<hash>E tail or
+     * .llvm suffix are one source function instantiated in different crates
+     * or codegen units.  They demangle to the same name, so that name is exact
+     * even though no single hash can be chosen; the hashes go in a comment.
+     */
+    private void resolveByHashVariants() throws Exception {
+        if (ambiguousSites.isEmpty()) return;
+        List<Site> unresolved = new ArrayList<>();
+        for (Site site : ambiguousSites) {
+            monitor.checkCancelled();
+            Set<String> hashless = new HashSet<>();
+            Set<String> variants = new TreeSet<>();
+            MatchResult selected = null;
+            for (MatchResult candidate : site.survivors) {
+                String identity = canonicalIdentity(candidate.module.primaryName());
+                String key = hashlessIdentity(identity);
+                if (key == null || !primaryAtEntry(candidate.module)) {
+                    hashless.clear();
+                    break;
+                }
+                hashless.add(key);
+                variants.add(identity);
+                if (selected == null || identity.compareTo(
+                    canonicalIdentity(selected.module.primaryName())) < 0) selected = candidate;
+            }
+            if (hashless.size() != 1) {
+                unresolved.add(site);
+                continue;
+            }
+            boolean create = functions.getFunctionAt(site.address) == null;
+            countAccepted(confidence(site, selected, create));
+            ensurePrimaryFunction(site, selected.module);
+            renameAt(site.address, selected.module.primaryName(), true,
+                new ArrayList<>(variants));
+            hashVariantResolved++;
+            hashVariantResolvedSites.add(site.address.getOffset());
+        }
+        ambiguousSites.clear();
+        ambiguousSites.addAll(unresolved);
+    }
+
+    private static boolean primaryAtEntry(Module module) {
+        String primary = module.primaryName();
+        for (PublicSymbol symbol : module.publics)
+            if (symbol.offset == 0 && symbol.name.equals(primary)) return true;
+        return false;
     }
 
     private void processAmbiguousSites() throws Exception {
@@ -2740,10 +3379,17 @@ public class ApplyFlirtSignatures extends GhidraScript {
             String alias = null;
             String operation = semantic == null ? operationConsensus(candidates) : null;
             String operationAlias = null;
+            String type = semantic == null && operation == null ? typeConsensus(candidates) : null;
+            String typeAlias = null;
             if (semantic != null) {
                 String proposedAlias = semanticAlias(semantic, ambiguityId);
                 Function function = functions.getFunctionAt(site.address);
-                if (function == null) {
+                if (function == null && dryRunFunctionSites.contains(site.address.getOffset())) {
+                    // The real run creates a default function here and renames it.
+                    semanticAliases++;
+                    alias = proposedAlias;
+                }
+                else if (function == null) {
                     semanticNoFunction++;
                     boolean labelApplied = false;
                     if (!dryRun) {
@@ -2781,8 +3427,10 @@ public class ApplyFlirtSignatures extends GhidraScript {
                     }
                     else if (semanticOwned && function.getName().equals(alias)) {
                         semanticExisting++;
+                        recordIdentity(site.address, AMBIGUOUS_RECORD + semantic);
                     }
-                    else if (!dryRun) {
+                    else if (dryRun) semanticAliases++;
+                    else {
                         if (semanticNamespace == null)
                             semanticNamespace = makeNamespace("FLIRT_Ambiguous");
                         try {
@@ -2790,6 +3438,7 @@ public class ApplyFlirtSignatures extends GhidraScript {
                             semanticAliases++;
                             if (semanticNamespace != null)
                                 function.setParentNamespace(semanticNamespace);
+                            recordIdentity(site.address, AMBIGUOUS_RECORD + semantic);
                         }
                         catch (Exception exception) {
                             errors++;
@@ -2823,8 +3472,24 @@ public class ApplyFlirtSignatures extends GhidraScript {
                     "common_terminal_operation_only", existingName, existingSource,
                     operation, proposed, candidateIdentityNames(candidates), applied));
             }
+            if (type != null) {
+                // Only the owning type or module is shared, so this stays a
+                // secondary label; the function keeps its own name.
+                typeConsensusSites++;
+                String proposed = approximateAlias("ambig_type_", type, ambiguityId);
+                boolean applied = false;
+                if (!dryRun) {
+                    if (semanticNamespace == null)
+                        semanticNamespace = makeNamespace("FLIRT_Ambiguous");
+                    applied = applyTypeLabel(site.address, proposed, semanticNamespace);
+                    if (applied) typeAlias = proposed;
+                }
+                semanticDiagnostics.add(new SemanticDiagnostic(
+                    "type_consensus", site.address, "common_type_or_module_only",
+                    null, null, type, proposed, candidateIdentityNames(candidates), applied));
+            }
             annotateAmbiguous(site, candidates, ambiguityId, digest,
-                created, semantic, alias, operation, operationAlias);
+                created, semantic, alias, operation, operationAlias, type, typeAlias);
             ambiguousRejected++;
         }
     }
@@ -2855,26 +3520,44 @@ public class ApplyFlirtSignatures extends GhidraScript {
         }
     }
 
-    /** Add an explicitly approximate secondary symbol without renaming a function. */
+    private static final int LABEL_SKIPPED = 0;
+    private static final int LABEL_EXISTING = 1;
+    private static final int LABEL_CREATED = 2;
+    private static final int LABEL_ERROR = 3;
+
     private boolean applyOperationLabel(Address address, String name,
                                         Namespace semanticNamespace) {
-        if (semanticNamespace == null || name == null || name.isEmpty()) return false;
+        int status = applyApproximateLabel(address, name, semanticNamespace);
+        if (status == LABEL_SKIPPED) operationLabelSkips++;
+        else if (status == LABEL_EXISTING) operationLabelsExisting++;
+        else if (status == LABEL_CREATED) operationLabels++;
+        else operationLabelErrors++;
+        return status == LABEL_EXISTING || status == LABEL_CREATED;
+    }
+
+    private boolean applyTypeLabel(Address address, String name, Namespace semanticNamespace) {
+        int status = applyApproximateLabel(address, name, semanticNamespace);
+        if (status == LABEL_SKIPPED) typeLabelSkips++;
+        else if (status == LABEL_EXISTING) typeLabelsExisting++;
+        else if (status == LABEL_CREATED) typeLabels++;
+        else typeLabelErrors++;
+        return status == LABEL_EXISTING || status == LABEL_CREATED;
+    }
+
+    /** Add an explicitly approximate secondary symbol without renaming a function. */
+    private int applyApproximateLabel(Address address, String name,
+                                      Namespace semanticNamespace) {
+        if (semanticNamespace == null || name == null || name.isEmpty()) return LABEL_SKIPPED;
         try {
             Function containing = functions.getFunctionContaining(address);
-            if (containing != null && !containing.getEntryPoint().equals(address)) {
-                operationLabelSkips++;
-                return false;
-            }
-            if (containing == null && listing.getDefinedDataContaining(address) != null) {
-                operationLabelSkips++;
-                return false;
-            }
+            if (containing != null && !containing.getEntryPoint().equals(address))
+                return LABEL_SKIPPED;
+            if (containing == null && listing.getDefinedDataContaining(address) != null)
+                return LABEL_SKIPPED;
             for (Symbol symbol : symbols.getSymbols(address)) {
                 if (symbol.getName().equals(name) &&
-                    symbol.getParentNamespace().equals(semanticNamespace)) {
-                    operationLabelsExisting++;
-                    return true;
-                }
+                    symbol.getParentNamespace().equals(semanticNamespace))
+                    return LABEL_EXISTING;
             }
             Function exact = functions.getFunctionAt(address);
             if (exact != null && exact.getSymbol().getSource() == SourceType.DEFAULT) {
@@ -2909,12 +3592,10 @@ public class ApplyFlirtSignatures extends GhidraScript {
             else {
                 symbols.createLabel(address, name, semanticNamespace, SourceType.ANALYSIS);
             }
-            operationLabels++;
-            return true;
+            return LABEL_CREATED;
         }
         catch (Exception exception) {
-            operationLabelErrors++;
-            return false;
+            return LABEL_ERROR;
         }
     }
 
@@ -2955,7 +3636,7 @@ public class ApplyFlirtSignatures extends GhidraScript {
             if (original.offset == 0 && functions.getFunctionAt(site.address) == null) continue;
             String logicalName = logicalIdentity(original.name);
             int before = appliedFunctionSites.size();
-            try { renameAt(site.address.add(original.offset), logicalName, false); }
+            try { applyPublic(site, original, logicalName, false); }
             catch (Exception exception) { errors++; }
             if (appliedFunctionSites.size() != before) logicalConsensusSymbols++;
         }
@@ -2963,7 +3644,8 @@ public class ApplyFlirtSignatures extends GhidraScript {
 
     private static String logicalIdentity(String name) {
         String canonical = canonicalIdentity(name);
-        return canonical == null ? null : canonical.replaceFirst("\\.llvm\\.[0-9]+$", "");
+        return canonical == null ? null :
+            STDCALL_SUFFIX.matcher(canonical).replaceFirst("").replaceFirst("\\.llvm\\.[0-9]+$", "");
     }
 
     /**
@@ -3072,14 +3754,18 @@ public class ApplyFlirtSignatures extends GhidraScript {
     }
 
     private boolean strongFunctionOrigin(Site site) {
-        if ((site.sources & (SOURCE_LINEAR_CALL | SOURCE_ENTRY |
+        return strongFunctionOrigin(site.sources);
+    }
+
+    private static boolean strongFunctionOrigin(int sources) {
+        if ((sources & (SOURCE_LINEAR_CALL | SOURCE_ENTRY |
              SOURCE_SIG_ANCHOR_VERIFIED)) != 0) return true;
-        if ((site.sources & SOURCE_RELOCATION) != 0 &&
-            (site.sources & (SOURCE_TYPED_POINTER | SOURCE_POINTER_TABLE)) != 0) return true;
+        if ((sources & SOURCE_RELOCATION) != 0 &&
+            (sources & (SOURCE_TYPED_POINTER | SOURCE_POINTER_TABLE)) != 0) return true;
         if (TRUST_EXACT_DATA_RELOCATION_POINTERS &&
-            (site.sources & SOURCE_DATA_RELOCATION_POINTER) != 0) return true;
-        return (site.sources & SOURCE_LINEAR_TAIL) != 0 &&
-            (site.sources & (SOURCE_REFERENCE | SOURCE_RELOCATION |
+            (sources & SOURCE_DATA_RELOCATION_POINTER) != 0) return true;
+        return (sources & SOURCE_LINEAR_TAIL) != 0 &&
+            (sources & (SOURCE_REFERENCE | SOURCE_RELOCATION |
              SOURCE_TYPED_POINTER | SOURCE_POINTER_TABLE)) != 0;
     }
 
@@ -3147,7 +3833,20 @@ public class ApplyFlirtSignatures extends GhidraScript {
                 containing.getEntryPoint() + ":" + containing.getName();
             return false;
         }
-        if (dryRun) return true;
+        if (dryRun) {
+            // Count the creation the real run would make from the same proof.
+            dryRunFunctionSites.add(site.address.getOffset());
+            functionsCreated++;
+            ambiguousFunctionsCreated++;
+            if (site.functionOnlyProof) {
+                functionOnlyCreated++;
+                if (site.provenBody != null) {
+                    explicitBodyCreated++;
+                    if (site.provenBody.getNumAddressRanges() > 1) nonContiguousBodyCreated++;
+                }
+            }
+            return true;
+        }
         Function function = site.functionOnlyProof && site.provenBody != null ?
             createFunctionWithBody(site.address, site.provenBody) :
             createFunctionAt(site.address);
@@ -3378,14 +4077,14 @@ public class ApplyFlirtSignatures extends GhidraScript {
         if (matches.size() < 2) return null;
         Set<String> values = new HashSet<>();
         for (MatchResult match : matches) {
-            String semantic = semanticRustIdentity(match.module.primaryName());
+            String semantic = semanticIdentity(match.module.primaryName());
             if (semantic == null) return null;
             values.add(semantic);
         }
         return values.size() == 1 ? values.iterator().next() : null;
     }
 
-    /** Return only the terminal Rust operation when every identity agrees. */
+    /** Return only the terminal operation when every identity agrees. */
     private static String operationConsensus(List<MatchResult> matches) {
         if (matches.size() < 2) return null;
         String common = null;
@@ -3394,16 +4093,131 @@ public class ApplyFlirtSignatures extends GhidraScript {
             String identity = canonicalIdentity(match.module.primaryName());
             if (identity == null) return null;
             identities.add(identity);
-            String semantic = semanticRustIdentity(match.module.primaryName());
-            if (semantic == null) return null;
-            List<String> parts = splitRustPath(semantic);
-            if (parts.isEmpty()) return null;
-            String operation = parts.get(parts.size() - 1);
+            String operation = operationIdentity(match.module.primaryName());
             if (!usefulOperation(operation)) return null;
             if (common == null) common = operation;
             else if (!common.equals(operation)) return null;
         }
         return identities.size() >= 2 ? common : null;
+    }
+
+    /**
+     * The type or module that owns every candidate when nothing narrower is
+     * shared, e.g. aho_corasick::ahocorasick::AhoCorasick for match_kind and
+     * memory_usage.  A bare generic parameter such as &T names no type.
+     */
+    private static String typeConsensus(List<MatchResult> matches) {
+        if (matches.size() < 2) return null;
+        String common = null;
+        Set<String> identities = new HashSet<>();
+        for (MatchResult match : matches) {
+            String identity = canonicalIdentity(match.module.primaryName());
+            String type = typeIdentity(match.module.primaryName());
+            if (identity == null || type == null) return null;
+            identities.add(identity);
+            if (common == null) common = type;
+            else if (!common.equals(type)) return null;
+        }
+        return identities.size() >= 2 ? common : null;
+    }
+
+    private static String typeIdentity(String name) {
+        if (name == null) return null;
+        List<String> scope = new ArrayList<>();
+        if (name.startsWith("?")) {
+            String[] parts = msvcSemanticParts(name);
+            if (parts == null || parts[0] == null) return null;
+            List<String> path = splitRustPath(parts[0]);
+            if (path.size() < 2) return null;
+            scope.addAll(path.subList(0, path.size() - 1));
+        }
+        else {
+            String display = demangleRust(logicalIdentity(name));
+            if (display == null) return null;
+            List<String> parts = splitRustPath(display);
+            if (!parts.isEmpty() && parts.get(parts.size() - 1).matches("h[0-9a-fA-F]{16}"))
+                parts.remove(parts.size() - 1);
+            if (parts.size() < 2) return null;
+            for (String part : parts.subList(0, parts.size() - 1)) {
+                String value = part.trim();
+                if (value.startsWith("<") && value.endsWith(">")) {
+                    // <Self as Trait> and <impl Trait for Self> belong to Self.
+                    String inner = value.substring(1, value.length() - 1).trim();
+                    int as = inner.indexOf(" as ");
+                    if (as >= 0) inner = inner.substring(0, as).trim();
+                    else if (inner.startsWith("impl ") && inner.lastIndexOf(" for ") >= 0)
+                        inner = inner.substring(inner.lastIndexOf(" for ") + 5).trim();
+                    for (String item : splitRustPath(inner)) scope.add(stripGenericArguments(item));
+                }
+                else scope.add(stripGenericArguments(value));
+            }
+        }
+        scope.removeIf(String::isEmpty);
+        if (scope.size() < 2) return null;
+        String result = String.join("::", scope);
+        return result.matches("[A-Za-z0-9_:]+") ? result : null;
+    }
+
+    /** Demangled path without generics or hashes, for Rust and MSVC names. */
+    private static String semanticIdentity(String name) {
+        if (name != null && name.startsWith("?")) {
+            String[] parts = msvcSemanticParts(name);
+            return parts == null || parts[0] == null ? null : parts[0];
+        }
+        return semanticRustIdentity(name);
+    }
+
+    private static String operationIdentity(String name) {
+        if (name != null && name.startsWith("?")) {
+            String[] parts = msvcSemanticParts(name);
+            return parts == null ? null : parts[1];
+        }
+        String semantic = semanticRustIdentity(name);
+        if (semantic == null) return null;
+        List<String> parts = splitRustPath(semantic);
+        return parts.isEmpty() ? null : parts.get(parts.size() - 1);
+    }
+
+    /**
+     * MSVC counterpart of semanticRustIdentity: {class path::name, name} with
+     * template arguments removed, so the scalar deleting destructors of
+     * unrelated classes share the operation scalar_deleting_destructor and
+     * basic_ostream<char> and basic_ostream<wchar_t> share one path.  The
+     * path is null when the demangled scope is a function-local one.
+     */
+    private static String[] msvcSemanticParts(String name) {
+        if (MSVC_SEMANTIC_CACHE.containsKey(name)) return MSVC_SEMANTIC_CACHE.get(name);
+        String[] result = null;
+        try {
+            DemangledObject object = MSVC_DEMANGLER.demangle(
+                MSVC_DEMANGLER.createMangledContext(name, null, null, null));
+            String operation = object == null ? null :
+                stripTemplateArguments(object.getName()).replace("`", "").replace("'", "").trim();
+            if (operation != null && !operation.isEmpty()) {
+                String scope = object.getNamespace() == null ? "" :
+                    stripTemplateArguments(object.getNamespace().getNamespaceString());
+                String path = scope.isEmpty() ? operation : scope + "::" + operation;
+                boolean localScope = scope.indexOf('`') >= 0 || scope.indexOf('(') >= 0 ||
+                    scope.indexOf(' ') >= 0;
+                result = new String[] { localScope ? null : path, operation };
+            }
+        }
+        catch (Exception ignored) { }
+        if (MSVC_SEMANTIC_CACHE.size() >= NAME_CACHE_LIMIT) MSVC_SEMANTIC_CACHE.clear();
+        MSVC_SEMANTIC_CACHE.put(name, result);
+        return result;
+    }
+
+    private static String stripTemplateArguments(String value) {
+        StringBuilder result = new StringBuilder(value.length());
+        int depth = 0;
+        for (int index = 0; index < value.length(); index++) {
+            char ch = value.charAt(index);
+            if (ch == '<') depth++;
+            else if (ch == '>' && depth > 0) depth--;
+            else if (depth == 0) result.append(ch);
+        }
+        return result.toString();
     }
 
     private static boolean usefulOperation(String operation) {
@@ -3490,6 +4304,16 @@ public class ApplyFlirtSignatures extends GhidraScript {
         return "ambig_" + base + suffix;
     }
 
+    private static String approximateAlias(String prefix, String text, String ambiguityId) {
+        String base = text.replaceAll("[^A-Za-z0-9_]+", "_")
+            .replaceAll("_+", "_").replaceAll("^_+|_+$", "");
+        if (base.isEmpty()) base = "unknown";
+        String suffix = "__" + ambiguityId.replace('-', '_');
+        int room = Math.max(1, 180 - prefix.length() - suffix.length());
+        if (base.length() > room) base = base.substring(0, room).replaceAll("_+$", "");
+        return prefix + base + suffix;
+    }
+
     private static String operationAlias(String operation, String ambiguityId) {
         String base = operation.replaceAll("[^A-Za-z0-9_]+", "_")
             .replaceAll("_+", "_").replaceAll("^_+|_+$", "");
@@ -3504,7 +4328,8 @@ public class ApplyFlirtSignatures extends GhidraScript {
                                    String ambiguityId, String digest,
                                    boolean functionCreated, String semantic,
                                    String alias, String operation,
-                                   String operationAlias) {
+                                   String operationAlias, String type,
+                                   String typeAlias) {
         List<String> names = new ArrayList<>(groupByIdentity(candidates).keySet());
         Collections.sort(names);
         StringBuilder note = new StringBuilder();
@@ -3522,6 +4347,11 @@ public class ApplyFlirtSignatures extends GhidraScript {
             note.append("common operation only (approximate): ").append(operation).append('\n');
             if (operationAlias != null)
                 note.append("operation Ghidra symbol: ").append(operationAlias).append('\n');
+        }
+        if (type != null) {
+            note.append("common type or module only (approximate): ").append(type).append('\n');
+            if (typeAlias != null)
+                note.append("type Ghidra symbol: ").append(typeAlias).append('\n');
         }
         note.append("candidate-set SHA256: ").append(digest).append('\n');
         for (int i = 0; i < Math.min(12, names.size()); i++)
@@ -3558,6 +4388,10 @@ public class ApplyFlirtSignatures extends GhidraScript {
         printf(" evidence mode      : SIG only%n");
         printf(" signature funcs    : %,d%n", signature.header.nFunctions);
         printf(" signature modules  : %,d%n", signature.modules);
+        printf(" match window bytes : %,d%n", signature.matchWindow);
+        printf(" beyond window      : %,d%n", signature.modulesBeyondWindow);
+        printf(" Rizin auto names   : %,d dropped publics, %,d modules%n",
+            signature.autoNamedPublicsDropped, signature.autoNamedModulesDropped);
         printf(" executable snapshots: %,d%n", executableSnapshotBlocks);
         printf(" executable bytes   : %,d%n", executableSnapshotBytes);
         printf(" snapshot read hits : %,d%n", executableSnapshotReads);
@@ -3574,7 +4408,9 @@ public class ApplyFlirtSignatures extends GhidraScript {
         printf(" SIG anchor raw hits: %,d%n", sigAnchorRawHits);
         printf(" SIG anchor cands   : %,d%n", sigAnchorCandidates);
         printf(" SIG anchor matches : %,d%n", sigAnchorSignatureHits);
-        printf(" SIG anchor rejected: %,d%n", sigAnchorCfgRejected);
+        printf(" anchor weak leaves : %,d%n", sigAnchorWeakLeavesSkipped);
+        printf(" SIG anchor weak    : %,d%n", sigAnchorWeakRejected);
+        printf(" SIG anchor CFG rej : %,d%n", sigAnchorCfgRejected);
         printf(" functions matched  : %,d%n", functionsMatched);
         printf(" created (undefined): %,d%n", functionsCreated);
         printf(" functions split     : %,d%n", functionsSplit);
@@ -3583,6 +4419,8 @@ public class ApplyFlirtSignatures extends GhidraScript {
         printf(" renamed            : %,d%n", renamed);
         printf(" already correct    : %,d%n", alreadyCorrect);
         printf(" unique applied funcs: %,d%n", appliedFunctionSites.size());
+        printf(" sweep ranges        : %,d (%,d bytes not yet code or data)%n",
+            sweepRanges, sweepBytes);
         printf(" native instructions : %,d%n", nativeInstructions);
         printf(" pseudo scan attempts: %,d%n", pseudoScanAttempts);
         printf(" native decode fails : %,d%n", nativeDecodeFailures);
@@ -3647,6 +4485,9 @@ public class ApplyFlirtSignatures extends GhidraScript {
         printf(" operation labels old: %,d%n", operationLabelsExisting);
         printf(" operation label skip: %,d%n", operationLabelSkips);
         printf(" operation label errs: %,d%n", operationLabelErrors);
+        printf(" type consensus     : %,d%n", typeConsensusSites);
+        printf(" type labels        : %,d  (existing %,d, skipped %,d, errors %,d)%n",
+            typeLabels, typeLabelsExisting, typeLabelSkips, typeLabelErrors);
         printf(" CFG decode cache hit: %,d%n", structuralDecodeCacheHits);
         printf(" CFG decode cache miss: %,d%n", structuralDecodeCacheMisses);
         printf(" subroutine cache hit: %,d%n", validSubroutineCacheHits);
@@ -3656,6 +4497,14 @@ public class ApplyFlirtSignatures extends GhidraScript {
         printf(" rust names demangled: %,d%n", rustNamesDemangled);
         printf(" rust demangle failed: %,d%n", rustDemangleFailed);
         printf(" raw names preserved: %,d%n", rawNamesPreserved);
+        printf(" Rust hash variants : %,d  (resolved to one demangled name)%n", hashVariantResolved);
+        printf(" secondary functions: %,d%n", secondaryPublicFunctions);
+        printf(" secondary labels   : %,d  (existing %,d, errors %,d)%n",
+            secondaryPublicLabels, secondaryPublicLabelsExisting, secondaryPublicLabelErrors);
+        printf(" signature conflicts: %,d  (earlier signature's name kept)%n", signatureConflicts);
+        printf(" imported names kept: %,d%n", importedNamesKept);
+        printf(" placeholders named : %,d  (entry / tls_callback_n, strong match)%n",
+            placeholderNamesReplaced);
         printf(" namespace errors   : %,d%n", namespaceErrors);
         printf(" errors             : %,d%n", errors);
         printf(" parse seconds      : %.3f%n", seconds(parseNanos));
@@ -3665,6 +4514,9 @@ public class ApplyFlirtSignatures extends GhidraScript {
         printf(" initial match secs : %.3f%n", seconds(initialMatchNanos));
         printf(" native find seconds: %.3f%n", seconds(discoveryNanos));
         printf(" native probe secs  : %.3f%n", seconds(probeNanos));
+        printf(" find breakdown secs: sweep %.3f, refs %.3f, relocs %.3f, pointer tables %.3f, boundaries %.3f, anchors %.3f%n",
+            seconds(sweepNanos), seconds(referenceNanos), seconds(relocationNanos),
+            seconds(pointerTableNanos), seconds(boundaryNanos), seconds(anchorScanNanos));
         printf(" apply seconds      : %.3f%n", seconds(applyNanos));
         printf(" elapsed seconds    : %.3f%n", elapsed);
         printSemanticDiagnosticSummary();
@@ -3694,7 +4546,7 @@ public class ApplyFlirtSignatures extends GhidraScript {
     private void writeJsonReport(Path path) throws Exception {
         double elapsed = (System.nanoTime() - startedNanos) / 1_000_000_000.0;
         String json = "{\n" +
-            "  \"schema_version\": \"1.5\",\n" +
+            "  \"schema_version\": \"1.8\",\n" +
             "  \"tool_version\": \"" + jsonEscape(TOOL_VERSION) + "\",\n" +
             "  \"signature\": \"" + jsonEscape(signaturePath.toString()) + "\",\n" +
             "  \"signature_sha256\": \"" + fileSha256(signaturePath) + "\",\n" +
@@ -3721,6 +4573,33 @@ public class ApplyFlirtSignatures extends GhidraScript {
             "  \"sig_anchor_candidates_found\": " + sigAnchorCandidates + ",\n" +
             "  \"sig_anchor_signature_hits\": " + sigAnchorSignatureHits + ",\n" +
             "  \"sig_anchor_cfg_rejected\": " + sigAnchorCfgRejected + ",\n" +
+            "  \"sig_anchor_weak_rejected\": " + sigAnchorWeakRejected + ",\n" +
+            "  \"sig_anchor_weak_leaves_skipped\": " + sigAnchorWeakLeavesSkipped + ",\n" +
+            "  \"match_window_bytes\": " + signature.matchWindow + ",\n" +
+            "  \"modules_beyond_match_window\": " + signature.modulesBeyondWindow + ",\n" +
+            "  \"rizin_auto_named_publics_dropped\": " + signature.autoNamedPublicsDropped + ",\n" +
+            "  \"rizin_auto_named_modules_dropped\": " + signature.autoNamedModulesDropped + ",\n" +
+            "  \"sweep_ranges\": " + sweepRanges + ",\n" +
+            "  \"sweep_bytes\": " + sweepBytes + ",\n" +
+            "  \"rust_hash_variant_resolved\": " + hashVariantResolved + ",\n" +
+            "  \"rust_hash_variant_resolved_sites\": " +
+                longAddressListJson(hashVariantResolvedSites) + ",\n" +
+            "  \"secondary_public_functions\": " + secondaryPublicFunctions + ",\n" +
+            "  \"secondary_public_labels\": " + secondaryPublicLabels + ",\n" +
+            "  \"secondary_public_labels_existing\": " + secondaryPublicLabelsExisting + ",\n" +
+            "  \"secondary_public_label_errors\": " + secondaryPublicLabelErrors + ",\n" +
+            "  \"signature_conflicts\": " + signatureConflicts + ",\n" +
+            "  \"signature_conflict_sites\": " + stringRowsJson(signatureConflictSites,
+                "address", "kept_library", "kept_identity", "library", "identity") + ",\n" +
+            "  \"imported_names_kept\": " + importedNamesKept + ",\n" +
+            "  \"placeholder_names_replaced\": " + placeholderNamesReplaced + ",\n" +
+            "  \"type_consensus_sites\": " + typeConsensusSites + ",\n" +
+            "  \"type_labels_created\": " + typeLabels + ",\n" +
+            "  \"type_labels_existing\": " + typeLabelsExisting + ",\n" +
+            "  \"type_label_skips\": " + typeLabelSkips + ",\n" +
+            "  \"type_label_errors\": " + typeLabelErrors + ",\n" +
+            "  \"imported_name_sites\": " + stringRowsJson(importedNameSites,
+                "address", "kept_name", "identity") + ",\n" +
             "  \"native_instructions\": " + nativeInstructions + ",\n" +
             "  \"pseudo_scan_attempts\": " + pseudoScanAttempts + ",\n" +
             "  \"native_candidates\": " + discoveredSources.size() + ",\n" +
@@ -3786,6 +4665,11 @@ public class ApplyFlirtSignatures extends GhidraScript {
             "  \"snapshot_seconds\": " + String.format(Locale.ROOT, "%.6f", seconds(snapshotNanos)) + ",\n" +
             "  \"anchor_index_seconds\": " + String.format(Locale.ROOT, "%.6f", seconds(anchorIndexNanos)) + ",\n" +
             "  \"anchor_scan_seconds\": " + String.format(Locale.ROOT, "%.6f", seconds(anchorScanNanos)) + ",\n" +
+            "  \"sweep_seconds\": " + String.format(Locale.ROOT, "%.6f", seconds(sweepNanos)) + ",\n" +
+            "  \"reference_scan_seconds\": " + String.format(Locale.ROOT, "%.6f", seconds(referenceNanos)) + ",\n" +
+            "  \"relocation_scan_seconds\": " + String.format(Locale.ROOT, "%.6f", seconds(relocationNanos)) + ",\n" +
+            "  \"pointer_table_scan_seconds\": " + String.format(Locale.ROOT, "%.6f", seconds(pointerTableNanos)) + ",\n" +
+            "  \"boundary_scan_seconds\": " + String.format(Locale.ROOT, "%.6f", seconds(boundaryNanos)) + ",\n" +
             "  \"semantic_diagnostics\": " + semanticDiagnosticsJson() + ",\n" +
             "  \"errors\": " + errors + ",\n" +
             "  \"elapsed_seconds\": " + String.format(Locale.ROOT, "%.6f", elapsed) + "\n" +
@@ -3829,6 +4713,21 @@ public class ApplyFlirtSignatures extends GhidraScript {
             json.append("]}");
         }
         return json.append("\n  ]").toString();
+    }
+
+    private static String stringRowsJson(List<String[]> rows, String... keys) {
+        StringBuilder json = new StringBuilder("[");
+        for (int row = 0; row < rows.size(); row++) {
+            if (row != 0) json.append(',');
+            json.append('{');
+            for (int key = 0; key < keys.length; key++) {
+                if (key != 0) json.append(',');
+                json.append('"').append(keys[key]).append("\":\"")
+                    .append(jsonEscape(rows.get(row)[key])).append('"');
+            }
+            json.append('}');
+        }
+        return json.append(']').toString();
     }
 
     private static String stringLongMapJson(Map<String, Long> values) {

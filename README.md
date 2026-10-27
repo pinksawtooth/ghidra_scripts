@@ -20,12 +20,18 @@ Additional features include:
 - Discovers candidates beyond existing functions by using entry points, calls, references, relocations, typed pointers, pointer tables, code boundaries, and rare signature anchors.
 - Creates functions at verified undefined locations and safely splits contained function candidates only when structural evidence is sufficient.
 - Resolves candidates with FLIRT reference-graph and structural evidence; unresolved ambiguity fails closed and is recorded with a bookmark and repeatable comment.
-- Preserves user-defined function names, groups applied symbols under the signature library namespace, and normalizes or demangles supported Rust symbols.
-- Supports `--dry-run` analysis and optional JSON reports through `--report-json`.
+- Names a site whose Rust candidates differ only by the legacy hash or `.llvm` suffix with their shared demangled name, and lists the candidate hashes in a repeatable comment.
+- Turns a public symbol at a non-zero module offset into a function only when the address has independent function-start evidence such as a call or an entry point; otherwise it becomes a label.
+- When the remaining candidates share a demangled meaning (Rust or MSVC C++), adds an approximate `ambig_` name or label, such as `scalar_deleting_destructor` for the deleting destructors of different classes; when only the owning type or module is shared, adds an `ambig_type_` label instead.
+- Preserves user-defined function names and names from the loader, exports or PDB (the loader placeholders `entry` and `tls_callback_<n>` are replaced only by a strong match), groups applied symbols under the signature library namespace, and normalizes or demangles supported Rust symbols (legacy and v0 mangling).
+- Records which signature named each function, so applying several signatures one after another never replaces an earlier name with a different identity; such a disagreement keeps the earlier name and is recorded with a bookmark and repeatable comment.
+- Supports `--dry-run` analysis, which counts the functions a real run would create and rename without changing the program, and optional JSON reports through `--report-json`.
 
 ## findcrypt.py
 
 Searches the current program for known cryptographic constants, including exact arrays, sparse arrays, and immediate operands, then labels or comments on matches.
+
+Memory is read in large pieces and searched with Python's byte search instead of asking Ghidra to search once per constant. On x86, only the instructions that contain the bytes of one of the immediate constants are decoded; set `USE_X86_BYTE_PREFILTER = False` at the top of the script to decode every instruction instead (RIP-relative operands whose target address equals a constant are then reported as well). Other processors always decode every instruction. The scan stops when the task is cancelled. The script needs PyGhidra (CPython 3) and does not run under Jython.
 
 ## shellcode_hash_search.py
 

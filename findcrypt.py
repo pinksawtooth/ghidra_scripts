@@ -8,307 +8,486 @@
 # PyGhidra compatible version
 
 import struct
-import struct
-import copy
-from java.lang.reflect import Array
-from java.lang import Byte
-import consts
-from ghidra.program.model.symbol import SourceType
-from ghidra.program.model.listing import CodeUnit, Data
-from ghidra.program.flatapi import FlatProgramAPI
-from ghidra.util.task import TaskMonitor
-from ghidra.program.model.mem import MemoryAccessException
-from ghidra.app.util import XReferenceUtil
 
-flatapi = FlatProgramAPI(currentProgram)
-monitor = globals().get("monitor") or TaskMonitor.DUMMY
+try:
+    from jpype import JArray, JByte
+except ImportError:
+    raise RuntimeError("findcrypt.py needs PyGhidra (CPython 3); it does not run under Jython")
+
+import consts
+from ghidra.program.flatapi import FlatProgramAPI
+from ghidra.program.model.address import AddressOutOfBoundsException, AddressSet
+from ghidra.program.model.data import ArrayDataType, ByteDataType, DWordDataType, QWordDataType
+from ghidra.program.model.listing import CodeUnit
+from ghidra.program.model.mem import MemoryAccessException
+from ghidra.util.exception import CancelledException
+from ghidra.util.task import TaskMonitor
+
+# PyGhidra runs the script with a dict subclass as its globals. A name that is not in it, a
+# builtin included, is first looked up on the Java script object, which adds up in a hot loop.
+# So bind the builtins the loops use, and what the script needs from GhidraScript, once.
+all, enumerate, int, len, max, min, range, sorted, zip = all, enumerate, int, len, max, min, range, sorted, zip
+program = currentProgram
+flatapi = FlatProgramAPI(program)
+try:
+    g_monitor = monitor
+except NameError:
+    g_monitor = TaskMonitor.DUMMY
 
 g_fc_prefix_cmt = 'FC: '
 g_fc_prefix_var = 'FC_'
 
-def convert_to_byte_array(const, big_endian=False):
-    byte_array = []
-    if const["size"] == "B":
-        byte_array = const["array"]
-    elif const["size"] == "L":
-        for val in const["array"]:
-            if big_endian:
-                byte_array += list(bytearray(struct.pack(">L", val)))
-            else:
-                byte_array += list(bytearray(struct.pack("<L", val)))
-    elif const["size"] == "Q":
-        for val in const["array"]:
-            if big_endian:
-                byte_array += list(bytearray(struct.pack(">Q", val)))
-            else:
-                byte_array += list(bytearray(struct.pack("<Q", val)))
-    
-    # Ensure all elements are integers (byte values)
-    return [x if isinstance(x, int) else ord(x) for x in byte_array]
+# Memory is pulled out of Ghidra in pieces of this size and searched with bytes.find().
+CHUNK_SIZE = 1 << 25
+# Sparse matches: the next immediate has to start within this many bytes after the previous one.
+SPARSE_GAP = 9
+# For x86, only decode instructions whose bytes contain one of the immediates (see scan_operand_x86).
+USE_X86_BYTE_PREFILTER = True
 
-def get_byte_array_as_bytes(byte_array):
-    # Convert list of ints to python bytes object for Ghidra findBytes
-    # Handle potential negative values if any (though consts should be unsigned bytes)
-    return bytes(bytearray(b & 0xFF for b in byte_array))
+ELEMENT_TYPES = {
+    "B": (ByteDataType.dataType, 1),
+    "L": (DWordDataType.dataType, 4),
+    "Q": (QWordDataType.dataType, 8),
+}
+
+
+def build_patterns():
+    """Return (const, bytes) for every constant array, little endian first, then big endian
+    for the multi-byte element sizes."""
+    patterns = []
+    for const in consts.constant_arrays:
+        size = const["size"]
+        array = const["array"]
+        if size == "B":
+            patterns.append((const, bytes(b & 0xFF for b in array)))
+        elif size in ("L", "Q"):
+            fmt = "%d%s" % (len(array), size)
+            patterns.append((const, struct.pack("<" + fmt, *array)))
+            patterns.append((const, struct.pack(">" + fmt, *array)))
+    return patterns
+
+
+def read_memory(memory, addr, length):
+    """Read up to length bytes at addr. Returns fewer bytes if readable memory ends first, none if it cannot be read."""
+    buf = JArray(JByte)(length)
+    try:
+        count = memory.getBytes(addr, buf)
+    except MemoryAccessException:
+        return b""
+    data = bytes(buf)
+    return data if count == length else data[:count]
+
+
+def read_tail(memory, addr, length):
+    """Read up to `length` bytes of what follows a range, as a window that runs off the end of the range sees them.
+
+    Returns (data, hard). Memory.getBytes() returns a short count when readable memory ends, but throws when
+    it reaches a byte mapped block whose source cannot be read; hard says it was the latter."""
+    for n in range(length, 0, -1):
+        buf = JArray(JByte)(n)
+        try:
+            count = memory.getBytes(addr, buf)
+        except MemoryAccessException:
+            continue
+        return bytes(buf)[:count], n < length
+    block = memory.getBlock(addr)
+    return b"", block is not None and block.isMapped()
+
+
+def iter_chunks(memory, start, length, lookahead, tail=0):
+    """Yield (offset, data, owned, hard) covering [start, start+length) in CHUNK_SIZE pieces.
+
+    data holds `owned` bytes followed by the next `lookahead` bytes of the range, so a match that starts in
+    the owned part and is at most lookahead + 1 bytes long lies completely inside data. A piece that reaches
+    the end of the range also gets up to `tail` bytes of what follows it (see read_tail for `hard`)."""
+    offset = 0
+    while offset < length:
+        g_monitor.checkCancelled()
+        owned = min(CHUNK_SIZE, length - offset)
+        if length - offset - owned == 1:
+            owned += 1  # never leave a single byte for the last piece
+        end = min(offset + owned + lookahead, length)
+        data = read_memory(memory, start.add(offset), end - offset)
+        hard = False
+        if tail and end == length and len(data) == end - offset:
+            try:
+                extra, hard = read_tail(memory, start.add(length), tail)
+                data += extra
+            except AddressOutOfBoundsException:
+                pass  # the range ends at the last address of its space
+        yield offset, data, owned, hard
+        offset += owned
+
+
+def address_at(start, offset):
+    """start + offset, written the way Ghidra's own address iterators write it (it shows for segmented x86).
+    Address.getOffset() is a signed long, so it is negative above 2**63 in a 64 bit space."""
+    flat = (start.getOffset() + offset + (1 << 63)) % (1 << 64) - (1 << 63)
+    return start.getAddressSpace().getAddress(flat)
+
+
+def readable_parts(memory, block):
+    """(offset, length) of the parts of `block` whose bytes can be read. A byte mapped block may only be
+    readable in places, where its source is initialized."""
+    if not block.isMapped():
+        return [(0, int(block.getSize()))] if block.isInitialized() else []
+    start = block.getStart()
+    readable = memory.getAllInitializedAddressSet().intersect(AddressSet(start, block.getEnd()))
+    return [(int(r.getMinAddress().subtract(start)), int(r.getLength())) for r in readable.getAddressRanges()]
+
 
 def make_data(addr, const_size, length):
-    # const_size: "B", "L", "Q"
-    # length: number of elements
-    program = currentProgram
-    listing = program.getListing()
-    if const_size == "B":
-        # Create array of bytes
-        # In Ghidra, createByte() creates a single byte. createData(addr, ByteDataType)
-        from ghidra.program.model.data import ByteDataType, ArrayDataType
-        dt = ByteDataType.dataType
-        # To make an array, we need ArrayDataType
-        # But findcrypt_ida just does repeated create_byte or make_array
-        # We will try to clean existing data first
-         # clear code/data
-        flatapi.clearListing(addr, addr.add(length))
-        flatapi.createByte(addr)
-        # Create array
-        listing.createData(addr, ArrayDataType(dt, length, 1))
+    # const_size: "B", "L", "Q"; length: number of elements
+    data_type, element_size = ELEMENT_TYPES[const_size]
+    flatapi.clearListing(addr, addr.add(length * element_size - 1))
+    program.getListing().createData(addr, ArrayDataType(data_type, length, element_size))
 
-    elif const_size == "L":
-        from ghidra.program.model.data import DWordDataType, ArrayDataType
-        dt = DWordDataType.dataType
-        flatapi.clearListing(addr, addr.add(length * 4))
-        flatapi.createDWord(addr)
-        listing.createData(addr, ArrayDataType(dt, length, 4))
 
-    elif const_size == "Q":
-        from ghidra.program.model.data import QWordDataType, ArrayDataType
-        dt = QWordDataType.dataType
-        flatapi.clearListing(addr, addr.add(length * 8))
-        flatapi.createQWord(addr)
-        listing.createData(addr, ArrayDataType(dt, length, 8))
+def add_comment(code_unit, comment_type, text, separator):
+    current = code_unit.getComment(comment_type) or ""
+    if not current:
+        code_unit.setComment(comment_type, text)
+    elif text not in current:
+        code_unit.setComment(comment_type, current + separator + text)
 
-def scan_exact_matches(constant_arrays2):
+
+def find_exact(memory, patterns):
+    """Map each distinct byte string of `patterns` to the addresses at which it occurs in the
+    loaded and initialized memory, in ascending order (overlapping occurrences included)."""
+    hits = {}
+    for _, data in patterns:
+        hits[data] = []
+    longest = max((len(data) for data in hits), default=1)
+
+    for rng in memory.getLoadedAndInitializedAddressSet().getAddressRanges():
+        g_monitor.checkCancelled()
+        start = rng.getMinAddress()
+        for offset, data, owned, _ in iter_chunks(memory, start, int(rng.getLength()), longest - 1):
+            for needle, found in hits.items():
+                limit = min(len(data), owned - 1 + len(needle))
+                pos = data.find(needle, 0, limit)
+                while pos != -1:
+                    found.append(address_at(start, offset + pos))
+                    pos = data.find(needle, pos + 1, limit)
+    return hits
+
+
+def scan_exact_matches(patterns):
     print("[*] Searching for crypto constants (Exact Matches)")
-    memory = currentProgram.getMemory()
-    blocks = memory.getBlocks()
-    
-    # Pre-convert byte arrays to python bytes for finding
-    # Tuple: (bytes_obj, const_dict)
-    search_list = []
-    for const in constant_arrays2:
-        b_obj = get_byte_array_as_bytes(const["byte_array"])
-        search_list.append((b_obj, const))
+    g_monitor.setMessage("findcrypt: exact matches")
 
-    # Iterate matching findcrypt_ida logic: filtering by segments is implicit in findBytes?
-    # findBytes searches entire memory.
-    # findcrypt_ida iterates segments. 
-    # Use global findBytes for efficiency.
-    
-    for b_obj, const in search_list:
-        if monitor.isCancelled(): break
-        
-        # Searching...
-        # print("Searching " + const["name"])
-        
-        addrs = []
-        cur_addr = memory.getMinAddress()
-        while True:
-            found = memory.findBytes(cur_addr, b_obj, None, True, monitor)
+    # Several constants can share the same bytes; each distinct byte string is searched once.
+    hits = find_exact(program.getMemory(), patterns)
+
+    for const, data in patterns:
+        for ea in hits[data]:
+            print("[*] {} - Found const array {}.{}".format(ea, const["algorithm"], const["name"]))
+
+            flatapi.createLabel(ea, g_fc_prefix_var + const["name"], True)
+            try:
+                make_data(ea, const["size"], len(const["array"]))
+            except Exception as e:
+                print("[!] {} - Could not define {} as an array: {}".format(ea, const["name"], e))
+
+
+class SparsePattern:
+    """One constant split into pointer-sized chunks, as an immediate-heavy code sequence would hold it."""
+
+    def __init__(self, const, data, value_len):
+        self.const = const
+        self.first = data[:value_len]
+        self.rest = [data[k:k + value_len] for k in range(value_len, len(data) // value_len * value_len, value_len)]
+        # Every later chunk has to turn up somewhere; checking a few of them first rules out
+        # almost every constant without walking its candidates.
+        probes = [self.rest[i] for i in sorted({0, len(self.rest) // 2, len(self.rest) - 1})] if self.rest else []
+        self.probes = probes
+
+
+def chunk_present(cache, data, chunk):
+    found = cache.get(chunk)
+    if found is None:
+        found = cache[chunk] = data.find(chunk) != -1
+    return found
+
+
+def sparse_block_hits_legacy(memory, block, sparse, value_len):
+    """The original search, which asks Ghidra about every single candidate. It is slow, but it follows
+    Ghidra's own rules for a byte mapped block that is readable only in places."""
+    start, end = block.getStart(), block.getEnd()
+    hits = [[] for _ in sparse]
+    for index, pattern in enumerate(sparse):
+        g_monitor.checkCancelled()
+        cur = start
+        while cur.compareTo(end) < 0:
+            found = memory.findBytes(cur, end, pattern.first, None, True, g_monitor)
             if found is None:
                 break
-            addrs.append(found)
-            cur_addr = found.add(1)
-        
-        for ea in addrs:
-            print("[*] {} - Found const array {}.{}".format(ea, const["algorithm"], const["name"]))
-            
-            # Rename
-            name = g_fc_prefix_var + const["name"]
-            # symbol creation
-            flatapi.createLabel(ea, name, True)
-            
-            # Create Data
-            make_data(ea, const["size"], len(const["array"]))
+            try:
+                tmp = found.add(value_len)
+            except AddressOutOfBoundsException:
+                tmp = None  # the end of the address space: nothing can follow
+            matched = True
+            for chunk in pattern.rest:
+                matched = False
+                if tmp is None:
+                    break
+                for i in range(1, SPARSE_GAP + 1):
+                    try:
+                        check = tmp.add(i)
+                    except AddressOutOfBoundsException:
+                        break
+                    if check.compareTo(end) > 0:
+                        break
+                    buf = JArray(JByte)(value_len)
+                    try:
+                        memory.getBytes(check, buf)
+                    except MemoryAccessException:
+                        break
+                    if bytes(buf) == chunk:
+                        try:
+                            tmp = check.add(value_len)
+                        except AddressOutOfBoundsException:
+                            tmp = None
+                        matched = True
+                        break
+                if not matched:
+                    break
+            if matched:
+                hits[index].append(int(found.subtract(start)))
+            try:
+                cur = found.add(1)
+            except AddressOutOfBoundsException:
+                break
+    return hits
 
-def scan_sparse_matches(constant_arrays2, value_len):
+
+def sparse_block_hits(memory, block, sparse, value_len, lookahead):
+    """Offsets (from the block start) at which each SparsePattern matches inside one block."""
+    size = int(block.getSize())
+    hits = [[] for _ in sparse]
+    if size < 2:
+        return hits
+    parts = readable_parts(memory, block)
+    if block.isMapped() and parts != [(0, size)]:
+        return sparse_block_hits_legacy(memory, block, sparse, value_len)
+    start = block.getStart()
+    for part_offset, part_length in parts:
+        for offset, data, owned, hard in iter_chunks(memory, start.add(part_offset), part_length, lookahead,
+                                                     value_len - 1):
+            if not data:
+                continue
+            base = part_offset + offset  # offset of data[0] within the block
+            avail = len(data)
+            # A read that runs off readable memory comes back zero filled, unless Ghidra throws instead.
+            padded = data if hard else data + bytes(value_len)
+            last = size - 1 - base  # index of the block's last byte within data
+            present = {}
+            starts = {}
+            for index, pattern in enumerate(sparse):
+                g_monitor.checkCancelled()
+                if not all(chunk_present(present, padded, c) for c in pattern.probes):
+                    continue
+                first = pattern.first
+                candidates = starts.get(first)
+                if candidates is None:
+                    candidates = starts[first] = []
+                    stop = min(avail, owned - 1 + len(first), last + len(first))
+                    pos = data.find(first, 0, stop)
+                    while pos != -1:
+                        candidates.append(pos)
+                        if pos >= last - 1:
+                            break
+                        pos = data.find(first, pos + 1, stop)
+                for pos in candidates:
+                    tmp = pos + value_len
+                    for chunk in pattern.rest:
+                        hi = min(tmp + SPARSE_GAP, last, avail - 1)
+                        nxt = padded.find(chunk, tmp + 1, hi + value_len) if hi > tmp else -1
+                        if nxt < 0:
+                            break
+                        tmp = nxt + value_len
+                    else:
+                        hits[index].append(base + pos)
+    return hits
+
+
+def scan_sparse_matches(patterns, value_len):
     print("[*] Searching for crypto constants (Sparse Matches)")
-    memory = currentProgram.getMemory()
-    blocks = memory.getBlocks()
-    
+    g_monitor.setMessage("findcrypt: sparse matches")
+    memory = program.getMemory()
+
+    sparse = [SparsePattern(const, data, value_len) for const, data in patterns]
+    chain = max((len(p.rest) + 1 for p in sparse), default=1) * (value_len + SPARSE_GAP)
+    lookahead = chain + value_len
+
     # We only look in Execute blocks (CODE)
-    
-    for block in blocks:
+    for block in memory.getBlocks():
         if not block.isExecute():
             continue
-            
+
         print("[*] Scanning block: {}".format(block.getName()))
-        
-        start_addr = block.getStart()
-        end_addr = block.getEnd()
-        
-        # We need to read memory. Using getBytes/getInt/getLong
-        
-        for const in constant_arrays2:
-            if monitor.isCancelled(): break
-            
-            # Optimization: Use findBytes for the FIRST chunk to locate candidates
-            first_chunk = const["byte_array"][:value_len]
-            first_chunk_bytes = get_byte_array_as_bytes(first_chunk)
-            
-            cur_addr = start_addr
-            while cur_addr < end_addr:
-                found = memory.findBytes(cur_addr, end_addr, first_chunk_bytes, None, True, monitor)
-                if found is None:
-                    break
-                
-                # Candidate found at 'found'. Check subsequent chunks.
-                # Logic:
-                # tmp = ea + value_len
-                # for j in range(1, len // value_len):
-                #   val = ...
-                #   for i in range(1, 10):
-                #     if get_val(tmp + i) == val:
-                #        tmp = tmp + i + value_len (Wait, IDA logic verification needed)
-                #        break
-                #   else: break (match failed)
-                # else: match found
-                
-                match = True
-                tmp_addr = found.add(value_len)
-                
-                num_chunks = len(const["byte_array"]) // value_len
-                
-                for j in range(1, num_chunks):
-                    # target value bytes
-                    chunk_start = j * value_len
-                    chunk_end = chunk_start + value_len
-                    target_bytes_list = const["byte_array"][chunk_start:chunk_end]
-                    target_bytes = get_byte_array_as_bytes(target_bytes_list)
-                    
-                    found_next = False
-                    for i in range(1, 10): # search window
-                        # We check bytes at tmp_addr + i (NOTE: IDA logic was tmp + i)
-                        # Is it byte offset or unit offset? 
-                        # IDA: ida_bytes.get_dword(tmp + i). 
-                        # get_dword takes byte address. So existing logic checks byte offsets 1..9.
-                        # BUT wait, instructions are usually aligned?
-                        # Using byte offsets 1..9 checks for unaligned immediates too.
-                        
-                        try:
-                            # Read value_len bytes at tmp_addr + i
-                            check_addr = tmp_addr.add(i)
-                            if check_addr > end_addr: break
-                            
-                            buffer = Array.newInstance(Byte.TYPE, value_len)
-                            memory.getBytes(check_addr, buffer)
-                            # Convert signed java bytes to python unsigned bytes checks
-                            mem_bytes_unsigned = bytes(bytearray(b & 0xFF for b in buffer))
-                            
-                            if mem_bytes_unsigned == target_bytes:
-                                tmp_addr = check_addr.add(value_len) # Advance base
-                                found_next = True
-                                break
-                        except MemoryAccessException:
-                            break
-                            
-                    if not found_next:
-                        match = False
-                        break
-                
-                if match:
-                    print("[*] {} - Found sparse constant {}.{}".format(found, const["algorithm"], const["name"]))
-                    
-                    # Add comment
-                    # idc.get_cmt(idc.prev_head(ea), 0)
-                    # Ghidra: get instruction before? or just at 'found'?
-                    # IDA prev_head implies the instruction containing this data or previous instruction?
-                    # If found points to an immediate inside an instruction, prev_head(found) is that instruction start.
-                    # Ghidra: getInstructionContaining(found)
-                    
-                    inst = flatapi.getInstructionContaining(found)
-                    if inst:
-                        cmt_addr = inst.getAddress()
-                        current_cmt = inst.getComment(CodeUnit.PRE_COMMENT) or ""
-                        new_cmt = g_fc_prefix_cmt + const["name"]
-                        if current_cmt:
-                            if new_cmt not in current_cmt:
-                                inst.setComment(CodeUnit.PRE_COMMENT, current_cmt + "\n" + new_cmt)
-                        else:
-                            inst.setComment(CodeUnit.PRE_COMMENT, new_cmt)
-                    else:
-                        # Fallback: EOL comment at address
-                        flatapi.setEOLComment(found, g_fc_prefix_cmt + const["name"])
-                        
-                # Advance search
-                cur_addr = found.add(1)
+        g_monitor.checkCancelled()
+
+        hits = sparse_block_hits(memory, block, sparse, value_len, lookahead)
+
+        start = block.getStart()
+        for pattern, offsets in zip(sparse, hits):
+            for offset in offsets:
+                found = address_at(start, offset)
+                const = pattern.const
+                print("[*] {} - Found sparse constant {}.{}".format(found, const["algorithm"], const["name"]))
+
+                inst = flatapi.getInstructionContaining(found)
+                if inst:
+                    add_comment(inst, CodeUnit.PRE_COMMENT, g_fc_prefix_cmt + const["name"], "\n")
+                else:
+                    flatapi.setEOLComment(found, g_fc_prefix_cmt + const["name"])
+
+
+def report_operand_constant(inst, const):
+    print("[*] {} - Found immediate operand constant {}.{}".format(inst.getAddress(), const["algorithm"], const["name"]))
+    add_comment(inst, CodeUnit.EOL_COMMENT, g_fc_prefix_cmt + const["name"], " ")
+
+
+def x86_immediate_patterns(values):
+    """Byte strings such that every x86 instruction with an immediate operand equal to one of
+    `values` contains at least one of them.
+
+    An x86 immediate is a little endian field of the instruction, which the SLEIGH spec zero or
+    sign extends to the operand size. So the value is stored either with its minimal little
+    endian encoding, or, if it reads as a negative number of a wider operand, as the narrower
+    field that sign extends to it."""
+    found = set()
+    for value in values:
+        found.add(value.to_bytes(max(1, (value.bit_length() + 7) // 8), "little"))
+        for bits in (16, 32, 64):
+            for field in (8, 16, 32):
+                if field < bits and (1 << bits) - (1 << (field - 1)) <= value < (1 << bits):
+                    found.add((value & ((1 << field) - 1)).to_bytes(field // 8, "little"))
+    # an occurrence of a longer pattern is also an occurrence of its prefix
+    return [p for p in found if not any(q != p and p.startswith(q) for q in found)]
+
+
+def scan_operand_x86(by_value):
+    """Decode only the instructions that contain the bytes of one of the immediates.
+
+    This reports the same operands as decoding every instruction of every function, except that
+    SLEIGH also exposes the target address of a RIP-relative operand as a scalar. Those addresses
+    are not instruction bytes and are skipped here; set USE_X86_BYTE_PREFILTER to False to see
+    them as well."""
+    memory = program.getMemory()
+    listing = program.getListing()
+    function_manager = program.getFunctionManager()
+    needles = x86_immediate_patterns(by_value)
+    lookahead = max(len(n) for n in needles) - 1
+
+    found = []  # (instruction, matching constants)
+    decoded = set()
+    for block in memory.getBlocks():
+        g_monitor.checkCancelled()
+        start = block.getStart()
+        # An instruction can start in the block before this one and run into it.
+        if not (listing.getInstructions(AddressSet(start, block.getEnd()), True).hasNext()
+                or listing.getInstructionContaining(start) is not None):
+            continue
+
+        for part_offset, part_length in readable_parts(memory, block):
+            part = start.add(part_offset)
+            last_end = -1  # end of the previously decoded instruction, as an offset from the start of the part
+            for offset, data, owned, _ in iter_chunks(memory, part, part_length, lookahead, lookahead):
+                positions = set()
+                for needle in needles:
+                    limit = min(len(data), owned - 1 + len(needle))
+                    pos = data.find(needle, 0, limit)
+                    while pos != -1:
+                        positions.add(pos)
+                        pos = data.find(needle, pos + 1, limit)
+                for n, pos in enumerate(sorted(positions)):
+                    if not n & 0xFFF:
+                        g_monitor.checkCancelled()
+                    if offset + pos <= last_end:
+                        continue
+                    inst = listing.getInstructionContaining(part.add(offset + pos))
+                    if inst is None:
+                        continue
+                    last_end = int(inst.getMaxAddress().subtract(part))
+                    if inst.getAddress() in decoded:
+                        continue
+                    decoded.add(inst.getAddress())
+                    consts = []
+                    for i in range(inst.getNumOperands()):
+                        scalar = inst.getScalar(i)
+                        if scalar is not None:
+                            consts.extend(by_value.get(scalar.getUnsignedValue(), ()))
+                    if consts:
+                        found.append((inst, consts))
+
+    # Only instructions inside a function count, reported function by function.
+    ordered = []
+    for inst, consts in found:
+        func = function_manager.getFunctionContaining(inst.getAddress())
+        if func is not None and not func.isThunk():
+            ordered.append((func.getEntryPoint(), inst.getAddress(), inst, consts))
+    ordered.sort(key=lambda t: (t[0], t[1]))
+    for _, _, inst, consts in ordered:
+        for const in consts:
+            report_operand_constant(inst, const)
+
+
+def scan_operand_generic(by_value):
+    listing = program.getListing()
+    for func in program.getFunctionManager().getFunctions(True):
+        g_monitor.checkCancelled()
+        if not func.isThunk():
+            for inst in listing.getInstructions(func.getBody(), True):
+                for i in range(inst.getNumOperands()):
+                    scalar = inst.getScalar(i)
+                    if scalar is not None:
+                        for const in by_value.get(scalar.getUnsignedValue(), ()):
+                            report_operand_constant(inst, const)
 
 
 def scan_operand_matches(constant_values):
     print("[*] Searching for crypto constants in immediate operand")
-    
-    # Iterate functions
-    func_iter = flatapi.getFirstFunction()
-    while func_iter:
-        if monitor.isCancelled(): break
-        
-        # Check flags (Lib/Thunk)
-        # Ghidra doesn't have exact FUNC_LIB flags on function usually, unless analyzed from library.
-        # We can check isThunk.
-        if not func_iter.isThunk():
-            # Iterate instructions
-            insts = currentProgram.getListing().getInstructions(func_iter.getBody(), True)
-            for inst in insts:
-                num_ops = inst.getNumOperands()
-                for i in range(num_ops):
-                    # Check for scalar (Immediate)
-                    # getScalar(i) returns Scalar object if operand is scalar
-                    scalar = inst.getScalar(i)
-                    if scalar:
-                        val = scalar.getUnsignedValue()
-                        
-                        # Check against constants
-                        for const in constant_values:
-                            if val == const["value"]:
-                                ea = inst.getAddress()
-                                print("[*] {} - Found immediate operand constant {}.{}".format(ea, const["algorithm"], const["name"]))
-                                
-                                current_cmt = inst.getComment(CodeUnit.EOL_COMMENT) or ""
-                                new_cmt = g_fc_prefix_cmt + const["name"]
-                                
-                                if current_cmt:
-                                     if new_cmt not in current_cmt:
-                                         inst.setComment(CodeUnit.EOL_COMMENT, current_cmt + " " + new_cmt)
-                                else:
-                                    inst.setComment(CodeUnit.EOL_COMMENT, new_cmt)
-        
-        func_iter = flatapi.getFunctionAfter(func_iter)
+    g_monitor.setMessage("findcrypt: immediate operands")
+
+    by_value = {}
+    for const in constant_values:
+        by_value.setdefault(const["value"], []).append(const)
+    if not by_value:
+        return
+
+    # x86 also has scalars that are not instruction bytes, such as the 1 of a shift by one.
+    if (USE_X86_BYTE_PREFILTER and min(by_value) >= 0x100
+            and str(program.getLanguage().getProcessor()) == "x86"):
+        scan_operand_x86(by_value)
+    else:
+        scan_operand_generic(by_value)
+
 
 def main():
     print("[*] Loading crypto constants")
-    
+
     # Determine pointer size (value_len)
-    ptr_size = currentProgram.getDefaultPointerSize()
-    
-    constant_arrays2 = []
-    for const in consts.constant_arrays:
-        # Create standard (little endian usually or logical byte array)
-        c_copy = copy.copy(const)
-        c_copy["byte_array"] = convert_to_byte_array(c_copy)
-        constant_arrays2.append(c_copy)
-        
-        if const["size"] != "B":
-            # Create big endian version
-            c_be = copy.copy(const)
-            c_be["byte_array"] = convert_to_byte_array(c_be, big_endian=True)
-            constant_arrays2.append(c_be)
-            
-    # Scan Exact
-    scan_exact_matches(constant_arrays2)
-    
-    # Scan Sparse
-    scan_sparse_matches(constant_arrays2, ptr_size)
-    
-    # Scan Operands
-    scan_operand_matches(consts.constant_values)
-    
+    ptr_size = int(program.getDefaultPointerSize())
+
+    patterns = build_patterns()
+
+    try:
+        # Scan Exact
+        scan_exact_matches(patterns)
+
+        # Scan Sparse
+        scan_sparse_matches(patterns, ptr_size)
+
+        # Scan Operands
+        scan_operand_matches(consts.constant_values)
+    except CancelledException:
+        print("[*] Cancelled")
+        return
+
     print("[*] Finished")
+
 
 if __name__ == '__main__':
     main()
